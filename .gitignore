@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+node_modules/
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Test files kept local-only (project policy)
+**/test_*.py
