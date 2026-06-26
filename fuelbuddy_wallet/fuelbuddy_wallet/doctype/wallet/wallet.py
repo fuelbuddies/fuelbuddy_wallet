@@ -29,6 +29,18 @@ BREACH_WINDOW_HOURS = 12
 # record name exactly -- the Wallet form's customer filter uses the same value.
 CASH_ADVANCE_TERMS = "Cash advance"
 
+# Master switch. The shared "Fuelbuddy Settings" single (hosted in fuelbuddy_crm,
+# read by all FuelBuddy apps) gates this whole feature via its "Enable Wallet" flag.
+# When off (the default), every cross-doctype hook below no-ops: no wallets are
+# auto-created on customer onboarding and Delivery Notes are not blocked on wallet
+# balance.
+FB_SETTINGS_DOCTYPE = "Fuelbuddy Settings"
+
+
+def _wallet_enabled():
+	"""True when the Wallet feature is enabled in Fuelbuddy Settings (default off)."""
+	return bool(frappe.db.get_single_value(FB_SETTINGS_DOCTYPE, "enable_wallet"))
+
 
 class Wallet(Document):
 	def before_save(self):
@@ -113,6 +125,8 @@ def enforce_wallet_balance(doc, method=None):
 	active breach allowance covers the shortfall. On a hard block, raise a
 	support Issue (in its own transaction so it survives the rollback) and throw.
 	"""
+	if not _wallet_enabled():
+		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
@@ -207,6 +221,8 @@ def update_wallet_on_delivery_note(doc, method=None):
 
 	Refresh received / delivered / remaining on the customer's wallet.
 	"""
+	if not _wallet_enabled():
+		return
 	wallet = get_customer_wallet(doc.customer)
 	if wallet:
 		recompute_from_deliveries(wallet, doc.customer)
@@ -218,6 +234,8 @@ def update_wallet_on_payment_entry(doc, method=None):
 	Refresh received (and remaining, against stored delivered) when a customer
 	payment is submitted.
 	"""
+	if not _wallet_enabled():
+		return
 	if doc.party_type != "Customer":
 		return
 	wallet = get_customer_wallet(doc.party)
@@ -229,6 +247,8 @@ def create_wallet_for_customer(doc, method=None):
 	"""Customer `after_insert`: auto-create a Wallet when the new customer is on
 	Cash-advance terms. Skips if a wallet already exists for the customer.
 	"""
+	if not _wallet_enabled():
+		return
 	if doc.payment_terms != CASH_ADVANCE_TERMS:
 		return
 	if get_customer_wallet(doc.name):
@@ -256,6 +276,8 @@ def close_expired_breaches():
 	always stamped when breach is enabled (see Wallet.before_save), so that's a no-op
 	in practice. Returns the list of closed wallet names.
 	"""
+	if not _wallet_enabled():
+		return []
 	cutoff = add_to_date(now_datetime(), hours=-BREACH_WINDOW_HOURS)
 	names = frappe.get_all(
 		"Wallet",
