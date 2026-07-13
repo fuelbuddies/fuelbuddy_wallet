@@ -146,6 +146,13 @@ doc_events = {
 	"Delivery Note": {
 		"validate": f"{_WALLET}.enforce_wallet_balance",
 		"on_update": f"{_WALLET}.update_wallet_on_delivery_note",
+		# Reverse a DN's wallet impact when it leaves the delivered set:
+		#   on_cancel   -- submitted DN 1->2 (docstatus 2 no longer counted)
+		#   after_delete-- draft DN deleted (e.g. backend order-cancel deletes the draft)
+		# Both recompute amount_delivered from the surviving DNs, so the cancelled/deleted
+		# DN's value is dropped and amount_remaining is freed.
+		"on_cancel": f"{_WALLET}.update_wallet_on_delivery_note",
+		"after_delete": f"{_WALLET}.update_wallet_on_delivery_note",
 	},
 	"Payment Entry": {
 		"on_submit": f"{_WALLET}.update_wallet_on_payment_entry",

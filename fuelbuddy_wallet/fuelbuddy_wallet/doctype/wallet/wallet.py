@@ -130,23 +130,27 @@ def enforce_wallet_balance(doc, method=None):
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
-		["name", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
+		["name", "amount_received", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
 		as_dict=True,
 	)
 	if not wallet:
 		return
 
+	# Real wallet recovery signal (received - ALL delivered incl. drafts). Used ONLY for the
+	# breach-window close below, never for the reservation math.
 	remaining = flt(wallet.amount_remaining)
 
-	# Reserve OTHER open drafts; current doc is added via dn_amount below (counted once).
-	drafts = frappe.get_all(
-		"Delivery Note",
-		filters={"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name]},
-		fields=["grand_total"],
-	)
-	draft_total = sum(flt(d.grand_total) for d in drafts)
+	# Room for THIS delivery = money received, minus value already committed by SUBMITTED DNs,
+	# minus value reserved by OTHER open drafts. The current doc is counted exactly once via
+	# dn_amount below. We recompute these two sums from live DNs instead of reusing the stored
+	# amount_remaining, which already nets ALL drafts (incl. this one on a re-save) and would
+	# double-count them — the bug that spuriously blocked a legitimate qty edit.
+	def _dn_sum(filters):
+		return sum(flt(d.grand_total) for d in frappe.get_all("Delivery Note", filters=filters, fields=["grand_total"]))
 
-	available = remaining - draft_total
+	committed = _dn_sum({"customer": doc.customer, "docstatus": 1})
+	other_drafts = _dn_sum({"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name or ""]})
+	available = flt(wallet.amount_received) - committed - other_drafts
 	dn_amount = flt(doc.grand_total)
 
 	if (available - dn_amount) >= 0:
@@ -184,8 +188,9 @@ def enforce_wallet_balance(doc, method=None):
 		description = (
 			"Customer: " + str(doc.customer) + "<br>"
 			"DN Amount: " + str(dn_amount) + "<br>"
-			"Wallet Remaining: " + str(remaining) + "<br>"
-			"Open Drafts Reserved: " + str(draft_total) + "<br>"
+			"Wallet Received: " + str(flt(wallet.amount_received)) + "<br>"
+			"Committed (submitted DNs): " + str(committed) + "<br>"
+			"Open Drafts Reserved (others): " + str(other_drafts) + "<br>"
 			"Available: " + str(available) + "<br>"
 			"Shortfall: " + str(shortfall) + "<br>"
 			"Breach Enabled: " + str(wallet.enable_breach) + "<br>"
@@ -217,9 +222,12 @@ def enforce_wallet_balance(doc, method=None):
 
 
 def update_wallet_on_delivery_note(doc, method=None):
-	"""Delivery Note `on_update` (was "Wallet update on DN", After Save).
+	"""Delivery Note on_update / on_cancel / after_delete.
 
-	Refresh received / delivered / remaining on the customer's wallet.
+	Refresh received / delivered / remaining on the customer's wallet by recomputing
+	from the surviving Delivery Notes (docstatus 0/1). Because it recomputes rather than
+	deltas, it is correct for create/update (DN now counted), cancel (DN 2, dropped) and
+	delete (DN gone, dropped) alike -- so cancelling or deleting a DN frees the wallet.
 	"""
 	if not _wallet_enabled():
 		return
