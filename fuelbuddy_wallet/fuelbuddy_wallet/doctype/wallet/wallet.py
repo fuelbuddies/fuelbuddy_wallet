@@ -20,7 +20,7 @@ has at most one.
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import add_to_date, flt, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, now_datetime, time_diff_in_seconds
 
 # Hours a breach stays open before it auto-closes (once the wallet has recovered).
 BREACH_WINDOW_HOURS = 12
@@ -112,6 +112,50 @@ def recompute_received(wallet_name):
 		wallet_name,
 		{"amount_received": ledger, "amount_remaining": ledger - delivered},
 	)
+
+
+@frappe.whitelist()
+def reconcile_wallet(wallet_name, apply=0):
+	"""Check the stored received / delivered / remaining against live GL and
+	Delivery Note totals; with ``apply=1`` correct them in place.
+
+	Safety net for bulk submit / cancel flows: every event handler recomputes
+	these totals, but a missed or raced event (parallel bulk workers) leaves
+	them stale. The recompute is total and idempotent, so correcting is always
+	safe. Manual breach fields are never touched.
+	"""
+	apply = cint(apply)
+	if apply:
+		# Serialize with live event recomputes on this wallet row.
+		frappe.db.get_value("Wallet", wallet_name, "name", for_update=True)
+	w = frappe.db.get_value(
+		"Wallet",
+		wallet_name,
+		["customer", "amount_received", "amount_delivered", "amount_remaining"],
+		as_dict=True,
+	)
+	if not w:
+		frappe.throw(f"Wallet {wallet_name} not found")
+	ledger = customer_gl_balance(w.customer)
+	delivered = customer_delivered_total(w.customer)
+	expected = {
+		"amount_received": ledger,
+		"amount_delivered": delivered,
+		"amount_remaining": ledger - delivered,
+	}
+	stored = {k: flt(w.get(k)) for k in expected}
+	in_sync = all(abs(stored[k] - flt(expected[k])) < 0.005 for k in expected)
+	corrected = False
+	if apply and not in_sync:
+		recompute_from_deliveries(wallet_name, w.customer)
+		corrected = True
+	return {
+		"customer": w.customer,
+		"stored": stored,
+		"expected": expected,
+		"in_sync": in_sync,
+		"corrected": corrected,
+	}
 
 
 # -- cross-doctype event handlers (wired in hooks.py doc_events) -------------
