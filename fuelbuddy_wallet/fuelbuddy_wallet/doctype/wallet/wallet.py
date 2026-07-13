@@ -266,13 +266,10 @@ def enforce_wallet_balance(doc, method=None):
 
 
 def update_wallet_on_delivery_note(doc, method=None):
-	"""Delivery Note on_update / on_cancel / after_delete.
+	"""Delivery Note `on_update` (fires on draft saves and on submit).
 
-	Refresh received / delivered / remaining on the customer's wallet by recomputing
-	from the surviving Delivery Notes (docstatus 0/1). Because it recomputes rather than
-	deltas, it is correct for create/update (DN now counted), cancel (DN 2, dropped) and
-	delete (DN gone, dropped) alike -- so cancelling or deleting a DN frees the wallet.
-	"""
+	Refresh received / delivered / remaining on the customer's wallet by
+	recomputing from the live Delivery Notes (docstatus 0/1)."""
 	if not _wallet_enabled():
 		return
 	wallet = get_customer_wallet(doc.customer)
@@ -280,19 +277,52 @@ def update_wallet_on_delivery_note(doc, method=None):
 		recompute_from_deliveries(wallet, doc.customer)
 
 
-def update_wallet_on_payment_entry(doc, method=None):
-	"""Payment Entry `on_submit` (was "Wallet amount update", After Submit).
-
-	Refresh received (and remaining, against stored delivered) when a customer
-	payment is submitted.
-	"""
+def update_wallet_on_delivery_note_cancel(doc, method=None):
+	"""Delivery Note `on_cancel` / `after_delete`: the DN leaves the delivered
+	set (docstatus 2, or gone), so the same total recompute drops its value and
+	frees amount_remaining."""
 	if not _wallet_enabled():
 		return
-	if doc.party_type != "Customer":
+	wallet = get_customer_wallet(doc.customer)
+	if wallet:
+		recompute_from_deliveries(wallet, doc.customer)
+
+
+def _recompute_received_for_customer(customer):
+	"""Shared body of the SI / PE handlers: both doctypes only move the customer's
+	GL, so their submit AND cancel refresh received (and remaining) from GL."""
+	if not _wallet_enabled():
 		return
-	wallet = get_customer_wallet(doc.party)
+	wallet = get_customer_wallet(customer)
 	if wallet:
 		recompute_received(wallet)
+
+
+def update_wallet_on_payment_entry_submit(doc, method=None):
+	"""Payment Entry `on_submit` (was "Wallet amount update", After Submit)."""
+	if doc.party_type == "Customer":
+		_recompute_received_for_customer(doc.party)
+
+
+def update_wallet_on_payment_entry_cancel(doc, method=None):
+	"""Payment Entry `on_cancel`: the payment's GL entries are cancelled, so the
+	wallet's received must drop — without this, a cancelled (e.g. bulk-cancelled)
+	PE leaves amount_received inflated until an unrelated event recomputes."""
+	if doc.party_type == "Customer":
+		_recompute_received_for_customer(doc.party)
+
+
+def update_wallet_on_sales_invoice_submit(doc, method=None):
+	"""Sales Invoice `on_submit`: SI writes customer GL debits, which change the
+	net GL balance the wallet's received is derived from."""
+	if doc.get("customer"):
+		_recompute_received_for_customer(doc.customer)
+
+
+def update_wallet_on_sales_invoice_cancel(doc, method=None):
+	"""Sales Invoice `on_cancel`: the SI's GL entries are cancelled; refresh."""
+	if doc.get("customer"):
+		_recompute_received_for_customer(doc.customer)
 
 
 def create_wallet_for_customer(doc, method=None):
