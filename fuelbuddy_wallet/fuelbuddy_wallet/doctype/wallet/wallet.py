@@ -20,7 +20,7 @@ has at most one.
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import add_to_date, flt, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, now_datetime, time_diff_in_seconds
 
 # Hours a breach stays open before it auto-closes (once the wallet has recovered).
 BREACH_WINDOW_HOURS = 12
@@ -114,6 +114,50 @@ def recompute_received(wallet_name):
 	)
 
 
+@frappe.whitelist()
+def reconcile_wallet(wallet_name, apply=0):
+	"""Check the stored received / delivered / remaining against live GL and
+	Delivery Note totals; with ``apply=1`` correct them in place.
+
+	Safety net for bulk submit / cancel flows: every event handler recomputes
+	these totals, but a missed or raced event (parallel bulk workers) leaves
+	them stale. The recompute is total and idempotent, so correcting is always
+	safe. Manual breach fields are never touched.
+	"""
+	apply = cint(apply)
+	if apply:
+		# Serialize with live event recomputes on this wallet row.
+		frappe.db.get_value("Wallet", wallet_name, "name", for_update=True)
+	w = frappe.db.get_value(
+		"Wallet",
+		wallet_name,
+		["customer", "amount_received", "amount_delivered", "amount_remaining"],
+		as_dict=True,
+	)
+	if not w:
+		frappe.throw(f"Wallet {wallet_name} not found")
+	ledger = customer_gl_balance(w.customer)
+	delivered = customer_delivered_total(w.customer)
+	expected = {
+		"amount_received": ledger,
+		"amount_delivered": delivered,
+		"amount_remaining": ledger - delivered,
+	}
+	stored = {k: flt(w.get(k)) for k in expected}
+	in_sync = all(abs(stored[k] - flt(expected[k])) < 0.005 for k in expected)
+	corrected = False
+	if apply and not in_sync:
+		recompute_from_deliveries(wallet_name, w.customer)
+		corrected = True
+	return {
+		"customer": w.customer,
+		"stored": stored,
+		"expected": expected,
+		"in_sync": in_sync,
+		"corrected": corrected,
+	}
+
+
 # -- cross-doctype event handlers (wired in hooks.py doc_events) -------------
 
 
@@ -130,23 +174,27 @@ def enforce_wallet_balance(doc, method=None):
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
-		["name", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
+		["name", "amount_received", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
 		as_dict=True,
 	)
 	if not wallet:
 		return
 
+	# Real wallet recovery signal (received - ALL delivered incl. drafts). Used ONLY for the
+	# breach-window close below, never for the reservation math.
 	remaining = flt(wallet.amount_remaining)
 
-	# Reserve OTHER open drafts; current doc is added via dn_amount below (counted once).
-	drafts = frappe.get_all(
-		"Delivery Note",
-		filters={"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name]},
-		fields=["grand_total"],
-	)
-	draft_total = sum(flt(d.grand_total) for d in drafts)
+	# Room for THIS delivery = money received, minus value already committed by SUBMITTED DNs,
+	# minus value reserved by OTHER open drafts. The current doc is counted exactly once via
+	# dn_amount below. We recompute these two sums from live DNs instead of reusing the stored
+	# amount_remaining, which already nets ALL drafts (incl. this one on a re-save) and would
+	# double-count them — the bug that spuriously blocked a legitimate qty edit.
+	def _dn_sum(filters):
+		return sum(flt(d.grand_total) for d in frappe.get_all("Delivery Note", filters=filters, fields=["grand_total"]))
 
-	available = remaining - draft_total
+	committed = _dn_sum({"customer": doc.customer, "docstatus": 1})
+	other_drafts = _dn_sum({"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name or ""]})
+	available = flt(wallet.amount_received) - committed - other_drafts
 	dn_amount = flt(doc.grand_total)
 
 	if (available - dn_amount) >= 0:
@@ -184,8 +232,9 @@ def enforce_wallet_balance(doc, method=None):
 		description = (
 			"Customer: " + str(doc.customer) + "<br>"
 			"DN Amount: " + str(dn_amount) + "<br>"
-			"Wallet Remaining: " + str(remaining) + "<br>"
-			"Open Drafts Reserved: " + str(draft_total) + "<br>"
+			"Wallet Received: " + str(flt(wallet.amount_received)) + "<br>"
+			"Committed (submitted DNs): " + str(committed) + "<br>"
+			"Open Drafts Reserved (others): " + str(other_drafts) + "<br>"
 			"Available: " + str(available) + "<br>"
 			"Shortfall: " + str(shortfall) + "<br>"
 			"Breach Enabled: " + str(wallet.enable_breach) + "<br>"
@@ -217,10 +266,10 @@ def enforce_wallet_balance(doc, method=None):
 
 
 def update_wallet_on_delivery_note(doc, method=None):
-	"""Delivery Note `on_update` (was "Wallet update on DN", After Save).
+	"""Delivery Note `on_update` (fires on draft saves and on submit).
 
-	Refresh received / delivered / remaining on the customer's wallet.
-	"""
+	Refresh received / delivered / remaining on the customer's wallet by
+	recomputing from the live Delivery Notes (docstatus 0/1)."""
 	if not _wallet_enabled():
 		return
 	wallet = get_customer_wallet(doc.customer)
@@ -228,19 +277,52 @@ def update_wallet_on_delivery_note(doc, method=None):
 		recompute_from_deliveries(wallet, doc.customer)
 
 
-def update_wallet_on_payment_entry(doc, method=None):
-	"""Payment Entry `on_submit` (was "Wallet amount update", After Submit).
-
-	Refresh received (and remaining, against stored delivered) when a customer
-	payment is submitted.
-	"""
+def update_wallet_on_delivery_note_cancel(doc, method=None):
+	"""Delivery Note `on_cancel` / `after_delete`: the DN leaves the delivered
+	set (docstatus 2, or gone), so the same total recompute drops its value and
+	frees amount_remaining."""
 	if not _wallet_enabled():
 		return
-	if doc.party_type != "Customer":
+	wallet = get_customer_wallet(doc.customer)
+	if wallet:
+		recompute_from_deliveries(wallet, doc.customer)
+
+
+def _recompute_received_for_customer(customer):
+	"""Shared body of the SI / PE handlers: both doctypes only move the customer's
+	GL, so their submit AND cancel refresh received (and remaining) from GL."""
+	if not _wallet_enabled():
 		return
-	wallet = get_customer_wallet(doc.party)
+	wallet = get_customer_wallet(customer)
 	if wallet:
 		recompute_received(wallet)
+
+
+def update_wallet_on_payment_entry_submit(doc, method=None):
+	"""Payment Entry `on_submit` (was "Wallet amount update", After Submit)."""
+	if doc.party_type == "Customer":
+		_recompute_received_for_customer(doc.party)
+
+
+def update_wallet_on_payment_entry_cancel(doc, method=None):
+	"""Payment Entry `on_cancel`: the payment's GL entries are cancelled, so the
+	wallet's received must drop — without this, a cancelled (e.g. bulk-cancelled)
+	PE leaves amount_received inflated until an unrelated event recomputes."""
+	if doc.party_type == "Customer":
+		_recompute_received_for_customer(doc.party)
+
+
+def update_wallet_on_sales_invoice_submit(doc, method=None):
+	"""Sales Invoice `on_submit`: SI writes customer GL debits, which change the
+	net GL balance the wallet's received is derived from."""
+	if doc.get("customer"):
+		_recompute_received_for_customer(doc.customer)
+
+
+def update_wallet_on_sales_invoice_cancel(doc, method=None):
+	"""Sales Invoice `on_cancel`: the SI's GL entries are cancelled; refresh."""
+	if doc.get("customer"):
+		_recompute_received_for_customer(doc.customer)
 
 
 def create_wallet_for_customer(doc, method=None):

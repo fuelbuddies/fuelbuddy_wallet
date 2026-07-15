@@ -143,12 +143,25 @@ app_license = "mit"
 # "After Submit" -> on_submit.
 _WALLET = "fuelbuddy_wallet.fuelbuddy_wallet.doctype.wallet.wallet"
 doc_events = {
+	# Per team convention: one submit-side and one cancel-side handler per doctype.
 	"Delivery Note": {
 		"validate": f"{_WALLET}.enforce_wallet_balance",
 		"on_update": f"{_WALLET}.update_wallet_on_delivery_note",
+		# Reverse a DN's wallet impact when it leaves the delivered set:
+		#   on_cancel   -- submitted DN 1->2 (docstatus 2 no longer counted)
+		#   after_delete-- draft DN deleted (e.g. backend order-cancel deletes the draft)
+		"on_cancel": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
+		"after_delete": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
+	},
+	# SI and PE both move the customer's GL, which received is derived from —
+	# submit AND cancel each refresh the wallet (bulk cancel included).
+	"Sales Invoice": {
+		"on_submit": f"{_WALLET}.update_wallet_on_sales_invoice_submit",
+		"on_cancel": f"{_WALLET}.update_wallet_on_sales_invoice_cancel",
 	},
 	"Payment Entry": {
-		"on_submit": f"{_WALLET}.update_wallet_on_payment_entry",
+		"on_submit": f"{_WALLET}.update_wallet_on_payment_entry_submit",
+		"on_cancel": f"{_WALLET}.update_wallet_on_payment_entry_cancel",
 	},
 	"Customer": {
 		"after_insert": f"{_WALLET}.create_wallet_for_customer",
