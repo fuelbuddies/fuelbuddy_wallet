@@ -78,13 +78,18 @@ def customer_gl_balance(customer):
 
 
 def customer_delivered_total(customer):
-	"""Sum of Delivery Note grand_total (draft + submitted) for the customer."""
+	"""Un-invoiced value of the customer's SUBMITTED Delivery Notes.
+
+	Only the not-yet-billed portion counts: once a DN is invoiced it becomes a Sales
+	Invoice customer-GL debit, which already lowers customer_gl_balance (amount_received),
+	so counting the full DN again would double-deduct the same delivery and spuriously
+	block later deliveries. per_billed is the % already billed."""
 	rows = frappe.db.get_all(
 		"Delivery Note",
-		filters={"customer": customer, "docstatus": ["in", [0, 1]]},
-		fields=["grand_total"],
+		filters={"customer": customer, "docstatus": 1, "per_billed": ["<", 100]},
+		fields=["grand_total", "per_billed"],
 	)
-	return sum((d.grand_total or 0) for d in rows)
+	return sum(flt(d.grand_total) * (100.0 - flt(d.per_billed)) / 100.0 for d in rows)
 
 
 def recompute_from_deliveries(wallet_name, customer):
@@ -171,9 +176,17 @@ def enforce_wallet_balance(doc, method=None):
 	"""
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
+	# Serialize concurrent DN saves for this customer on the wallet row: without this two
+	# deliveries read the same balance, both pass, and the wallet goes negative. The lock is
+	# held to the end of this transaction, so a competing save waits and then sees this DN.
+	locked = frappe.db.get_value(
+		"Wallet", {"customer": doc.customer, "payment_type": "Wallet"}, "name", for_update=True
+	)
+	if not locked:
+		return
 	wallet = frappe.db.get_value(
 		"Wallet",
-		{"customer": doc.customer, "payment_type": "Wallet"},
+		locked,
 		["name", "amount_received", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
 		as_dict=True,
 	)
@@ -184,16 +197,21 @@ def enforce_wallet_balance(doc, method=None):
 	# breach-window close below, never for the reservation math.
 	remaining = flt(wallet.amount_remaining)
 
-	# Room for THIS delivery = money received, minus value already committed by SUBMITTED DNs,
-	# minus value reserved by OTHER open drafts. The current doc is counted exactly once via
-	# dn_amount below. We recompute these two sums from live DNs instead of reusing the stored
-	# amount_remaining, which already nets ALL drafts (incl. this one on a re-save) and would
-	# double-count them — the bug that spuriously blocked a legitimate qty edit.
-	def _dn_sum(filters):
-		return sum(flt(d.grand_total) for d in frappe.get_all("Delivery Note", filters=filters, fields=["grand_total"]))
-
-	committed = _dn_sum({"customer": doc.customer, "docstatus": 1})
-	other_drafts = _dn_sum({"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name or ""]})
+	# Room for THIS delivery = money received, minus value already committed by SUBMITTED DNs
+	# (un-invoiced portion only -- invoiced value is already netted out of amount_received via
+	# GL debits, see customer_delivered_total), minus value reserved by OTHER open drafts. The
+	# current doc is counted exactly once via dn_amount below. We recompute from live DNs
+	# instead of reusing stored amount_remaining, which already nets ALL drafts (incl. this one
+	# on a re-save) and would double-count them — the bug that spuriously blocked a qty edit.
+	committed = customer_delivered_total(doc.customer)
+	other_drafts = sum(
+		flt(d.grand_total)  # drafts are never billed, so their full value reserves balance
+		for d in frappe.get_all(
+			"Delivery Note",
+			filters={"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name or ""]},
+			fields=["grand_total"],
+		)
+	)
 	available = flt(wallet.amount_received) - committed - other_drafts
 	dn_amount = flt(doc.grand_total)
 
