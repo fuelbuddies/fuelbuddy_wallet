@@ -15,7 +15,8 @@
   "section_break_qhce",
   "amount_received",
   "amount_delivered",
-  "amount_remaining"
+  "amount_remaining",
+  "block_amount"
  ],
  "fields": [
   {
@@ -84,6 +85,14 @@
    "fieldname": "amount_remaining",
    "fieldtype": "Currency",
    "label": "Amount Remaining"
+  },
+  {
+   "default": "0.0",
+   "description": "Amount reserved by active dispensing blocks (Wallet Block rows). Available for dispensing = Amount Remaining - Block Amount.",
+   "fieldname": "block_amount",
+   "fieldtype": "Currency",
+   "label": "Block Amount",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,

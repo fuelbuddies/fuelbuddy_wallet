@@ -163,6 +163,115 @@ def reconcile_wallet(wallet_name, apply=0):
 	}
 
 
+# -- dispensing blocks (IDEV-3134: called by erp-functions over REST) --------
+
+
+@frappe.whitelist()
+def block_wallet_amount(customer, amount, task_id, customer_asset_id):
+	"""Reserve ``amount`` against the customer's wallet for one (task, asset)
+	dispensing, mirroring the ops-side block: available = amount_remaining -
+	block_amount, insufficient balance returns ``blocked: False`` instead of
+	throwing (the caller treats ERP as advisory during dual-run), and re-blocking
+	the same (task, asset) is a no-op. One Wallet Block row is created per
+	successful block; the Wallet's block_amount is the sum of Active rows.
+
+	No breach allowance here: breach is a Delivery-Note-save escape hatch, not a
+	reservation budget (ops blocking has no exception concept either).
+	"""
+	if not _wallet_enabled():
+		return {"blocked": False, "reason": "wallet_disabled"}
+	amount = flt(amount)
+	if amount <= 0 or not task_id or not customer_asset_id:
+		frappe.throw("amount (> 0), task_id and customer_asset_id are required")
+	# Same serialization as enforce_wallet_balance: lock the wallet row so
+	# concurrent blocks (and DN saves) see each other's reservations.
+	locked = frappe.db.get_value(
+		"Wallet", {"customer": customer, "payment_type": "Wallet"}, "name", for_update=True
+	)
+	if not locked:
+		return {"blocked": False, "reason": "no_wallet"}
+	w = frappe.db.get_value(
+		"Wallet", locked, ["amount_remaining", "block_amount"], as_dict=True
+	)
+	balance = flt(w.amount_remaining)
+	block_amount = flt(w.block_amount)
+	available = balance - block_amount
+	base = {
+		"wallet_name": locked,
+		"balance": balance,
+		"block_amount": block_amount,
+		"available": available,
+	}
+	# Idempotency per (task, asset): only ACTIVE rows count -- a Released row
+	# means the reservation was consumed/freed, and a fresh block is allowed.
+	existing = frappe.db.get_value(
+		"Wallet Block",
+		{
+			"wallet": locked,
+			"task_id": task_id,
+			"customer_asset_id": customer_asset_id,
+			"status": "Active",
+		},
+		"name",
+	)
+	if existing:
+		return dict(base, blocked=True, already_blocked=True)
+	if available - amount < 0:
+		return dict(base, blocked=False, reason="insufficient_balance")
+	frappe.get_doc(
+		{
+			"doctype": "Wallet Block",
+			"wallet": locked,
+			"task_id": task_id,
+			"customer_asset_id": customer_asset_id,
+			"amount": amount,
+		}
+	).insert(ignore_permissions=True)
+	frappe.db.set_value("Wallet", locked, "block_amount", block_amount + amount)
+	return dict(
+		base,
+		blocked=True,
+		amount=amount,
+		block_amount=block_amount + amount,
+		available=available - amount,
+	)
+
+
+@frappe.whitelist()
+def release_wallet_block(task_id, customer_asset_id=None):
+	"""Release the Active Wallet Blocks for ``task_id`` (all assets, or just
+	``customer_asset_id``): flip them to Released and give the amount back to
+	the wallet's block_amount, clamped at zero.
+
+	Deliberately NOT gated on _wallet_enabled(): stale reservations must stay
+	freeable even after the feature is switched off. Idempotent -- a second call
+	finds no Active rows and releases nothing.
+	"""
+	if not task_id:
+		frappe.throw("task_id is required")
+	filters = {"task_id": task_id, "status": "Active"}
+	if customer_asset_id:
+		filters["customer_asset_id"] = customer_asset_id
+	blocks = frappe.get_all(
+		"Wallet Block", filters=filters, fields=["name", "wallet", "amount"]
+	)
+	if not blocks:
+		return {"released": 0, "total_amount": 0}
+	total = 0.0
+	block_amount = None
+	for wallet_name in {b.wallet for b in blocks}:
+		frappe.db.get_value("Wallet", wallet_name, "name", for_update=True)
+		wallet_blocks = [b for b in blocks if b.wallet == wallet_name]
+		released = sum(flt(b.amount) for b in wallet_blocks)
+		for b in wallet_blocks:
+			frappe.db.set_value("Wallet Block", b.name, "status", "Released")
+		current = flt(frappe.db.get_value("Wallet", wallet_name, "block_amount"))
+		block_amount = max(0.0, current - released)  # clamp: never negative
+		frappe.db.set_value("Wallet", wallet_name, "block_amount", block_amount)
+		total += released
+	return {"released": len(blocks), "total_amount": total, "block_amount": block_amount}
+
+
 # -- cross-doctype event handlers (wired in hooks.py doc_events) -------------
 
 
