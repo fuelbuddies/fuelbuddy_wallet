@@ -20,7 +20,7 @@ has at most one.
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import add_to_date, cint, flt, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, time_diff_in_seconds
 
 # Hours a breach stays open before it auto-closes (once the wallet has recovered).
 BREACH_WINDOW_HOURS = 12
@@ -77,11 +77,30 @@ def customer_gl_balance(customer):
 	return ledger
 
 
-def customer_delivered_total(customer):
-	"""Sum of Delivery Note grand_total (draft + submitted) for the customer."""
+def _wallet_start_date(customer):
+	"""Date the customer's wallet starts tracking Delivery Notes (None = no wallet)."""
+	return frappe.db.get_value(
+		"Wallet", {"customer": customer, "payment_type": "Wallet"}, "wallet_start_date"
+	)
+
+
+def _dn_filters(customer, start_date, **extra):
+	"""Delivery Note filters for the wallet: the customer's DNs posted on or after
+	``start_date``. DNs before the wallet started are invisible to it."""
+	filters = {"customer": customer, **extra}
+	if start_date:
+		filters["posting_date"] = [">=", start_date]
+	return filters
+
+
+def customer_delivered_total(customer, start_date=None):
+	"""Sum of Delivery Note grand_total (draft + submitted) for the customer,
+	counting only DNs posted on or after the wallet start date."""
+	if start_date is None:
+		start_date = _wallet_start_date(customer)
 	rows = frappe.db.get_all(
 		"Delivery Note",
-		filters={"customer": customer, "docstatus": ["in", [0, 1]]},
+		filters=_dn_filters(customer, start_date, docstatus=["in", [0, 1]]),
 		fields=["grand_total"],
 	)
 	return sum((d.grand_total or 0) for d in rows)
@@ -174,11 +193,16 @@ def enforce_wallet_balance(doc, method=None):
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
-		["name", "amount_received", "amount_remaining", "enable_breach", "breach_amount", "date_of_breach"],
+		[
+			"name", "amount_received", "amount_remaining", "enable_breach", "breach_amount",
+			"date_of_breach", "wallet_start_date",
+		],
 		as_dict=True,
 	)
 	if not wallet:
 		return
+	if wallet.wallet_start_date and getdate(doc.posting_date) < getdate(wallet.wallet_start_date):
+		return  # DN predates the wallet: not tracked by it, so never blocked by it
 
 	# Real wallet recovery signal (received - ALL delivered incl. drafts). Used ONLY for the
 	# breach-window close below, never for the reservation math.
@@ -192,8 +216,9 @@ def enforce_wallet_balance(doc, method=None):
 	def _dn_sum(filters):
 		return sum(flt(d.grand_total) for d in frappe.get_all("Delivery Note", filters=filters, fields=["grand_total"]))
 
-	committed = _dn_sum({"customer": doc.customer, "docstatus": 1})
-	other_drafts = _dn_sum({"customer": doc.customer, "docstatus": 0, "name": ["!=", doc.name or ""]})
+	start = wallet.wallet_start_date
+	committed = _dn_sum(_dn_filters(doc.customer, start, docstatus=1))
+	other_drafts = _dn_sum(_dn_filters(doc.customer, start, docstatus=0, name=["!=", doc.name or ""]))
 	available = flt(wallet.amount_received) - committed - other_drafts
 	dn_amount = flt(doc.grand_total)
 
@@ -231,6 +256,7 @@ def enforce_wallet_balance(doc, method=None):
 	if not ticket:
 		description = (
 			"Customer: " + str(doc.customer) + "<br>"
+			"Wallet Start Date: " + str(wallet.wallet_start_date) + "<br>"
 			"DN Amount: " + str(dn_amount) + "<br>"
 			"Wallet Received: " + str(flt(wallet.amount_received)) + "<br>"
 			"Committed (submitted DNs): " + str(committed) + "<br>"
