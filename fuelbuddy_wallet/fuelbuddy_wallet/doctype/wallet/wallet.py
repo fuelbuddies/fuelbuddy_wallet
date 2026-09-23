@@ -249,6 +249,11 @@ def enforce_wallet_balance(doc, method=None):
 				"priority": "High",
 				"issue_type": "Error Log",
 				"description": description,
+				# Same identity fields erp-functions stamps on its Issues, so ops can trace
+				# the blocked punch back to the Hasura invoiced_item / order.
+				"customer": doc.customer,
+				"custom_invoice_item_id": doc.get("custom_invoiced_item_id"),
+				"custom_order_code": doc.get("custom_order_code"),
 			},
 		)
 
