@@ -142,6 +142,9 @@ app_license = "mit"
 # to these hooks: "Before Save" -> validate, "After Save" -> on_update,
 # "After Submit" -> on_submit.
 _WALLET = "fuelbuddy_wallet.fuelbuddy_wallet.doctype.wallet.wallet"
+
+# Payment Type rows ("Wallet", "Credit Limit") the Wallet.payment_type Link points at
+fixtures = ["Payment Type"]
 doc_events = {
 	# Per team convention: one submit-side and one cancel-side handler per doctype.
 	"Delivery Note": {

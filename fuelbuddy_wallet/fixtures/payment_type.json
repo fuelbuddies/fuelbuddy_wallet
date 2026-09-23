@@ -1,0 +1,16 @@
+[
+ {
+  "docstatus": 0,
+  "doctype": "Payment Type",
+  "modified": "2026-06-29 09:21:41.952916",
+  "name": "Wallet",
+  "payment_type": "Wallet"
+ },
+ {
+  "docstatus": 0,
+  "doctype": "Payment Type",
+  "modified": "2026-06-29 09:21:52.251667",
+  "name": "Credit Limit",
+  "payment_type": "Credit Limit"
+ }
+]
