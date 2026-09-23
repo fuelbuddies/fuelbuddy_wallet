@@ -18,6 +18,8 @@ A "Wallet" is the row whose ``payment_type`` is literally "Wallet"; a customer
 has at most one.
 """
 
+from types import SimpleNamespace
+
 import frappe
 from frappe.model.document import Document
 from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, time_diff_in_seconds
@@ -84,26 +86,113 @@ def _wallet_start_date(customer):
 	)
 
 
-def _dn_filters(customer, start_date, **extra):
-	"""Delivery Note filters for the wallet: the customer's DNs posted on or after
-	``start_date``. DNs before the wallet started are invisible to it."""
-	filters = {"customer": customer, **extra}
+def _dn_where(customer, start_date, docstatus, exclude=None):
+	"""SQL conditions (+ params) selecting the customer's wallet-tracked Delivery
+	Notes: posted on or after ``start_date`` (DNs before the wallet started are
+	invisible to it), in ``docstatus``, optionally excluding one DN by name."""
+	cond = ["dn.customer = %(customer)s", "dn.docstatus in %(docstatus)s"]
+	params = {"customer": customer, "docstatus": tuple(docstatus)}
 	if start_date:
-		filters["posting_date"] = [">=", start_date]
-	return filters
+		cond.append("dn.posting_date >= %(start)s")
+		params["start"] = start_date
+	if exclude:
+		cond.append("dn.name != %(exclude)s")
+		params["exclude"] = exclude
+	return " and ".join(cond), params
+
+
+def _billable_net(customer, rows, as_on=None):
+	"""Net value of Delivery Note quantities AS THE INVOICE WILL BILL THEM.
+
+	``rows`` = (so_detail, sales_order, posting_date, item_code, qty, dn_net).
+	Mirrors fuelbuddy_crm invoicing in order:
+	  1. Force Majeure (IDEV-3129): a delivery whose date falls in a submitted
+	     Trigger AND an approved Pricing for this customer bills at the flat
+	     agreed rate for the item, deal discount suppressed.
+	  2. Everything else is priced off the SALES ORDER LINE (make_sales_invoice
+	     bills every litre at the SO line's current price_list_rate / rate, not
+	     the price the DN carried on delivery day), then run through the SAME
+	     deal-discount formula as auto-invoicing, whose source resolves
+	     Opportunity -> Discount doc -> Quotation -> SO, off the catalog list price.
+	No SO line -> the DN's own net, unchanged.
+
+	# ponytail: slab qty = the counted DN set per SO, not the invoice cycle;
+	# exact for non-slab deals, close for slabs -- widen if finance asks.
+	"""
+	try:
+		from fuelbuddy_crm.auto_invoicing import _apply_quotation_discount
+		from fuelbuddy_crm.force_majeure import fm_rate, fm_resolver
+	except ImportError:  # crm app absent: wallet falls back to undiscounted DN value
+		return sum(flt(r[5]) for r in rows)
+	resolve = fm_resolver(customer)
+	total = 0.0
+	qty_by_line = {}  # (sales_order, so_detail) -> qty
+	for so_detail, so, on, item_code, qty, dn_net in rows:
+		qty = flt(qty)
+		pricing = resolve(on) if (resolve and on) else None
+		rate = fm_rate(pricing, item_code) if pricing else None
+		if rate:
+			total += qty * rate
+		elif so_detail and so:
+			qty_by_line[(so, so_detail)] = qty_by_line.get((so, so_detail), 0.0) + qty
+		else:
+			total += flt(dn_net)
+	per_so = {}
+	for (so, so_detail), qty in qty_by_line.items():
+		so_line = frappe.db.get_value("Sales Order Item", so_detail, ["price_list_rate", "rate"], as_dict=True)
+		if not so_line or qty <= 0:
+			continue
+		per_so.setdefault(so, []).append(
+			frappe._dict(qty=qty, price_list_rate=flt(so_line.price_list_rate) or flt(so_line.rate), rate=flt(so_line.rate))
+		)
+	for so, lines in per_so.items():
+		# SimpleNamespace, not frappe._dict: the formula reads ``si.items`` as an attribute.
+		_apply_quotation_discount(
+			SimpleNamespace(posting_date=as_on, items=lines),
+			frappe.get_cached_doc("Sales Order", so),
+		)
+		total += sum(flt(l.rate) * flt(l.qty) for l in lines)  # rate unchanged when no discount
+	return total
+
+
+def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
+	"""Grand-total value (incl. VAT) of the customer's wallet-tracked Delivery
+	Notes as they will be billed: quantities valued by _billable_net, VAT put
+	back at the set's own grand/net ratio."""
+	where, params = _dn_where(customer, start_date, docstatus, exclude)
+	rows = frappe.db.sql(
+		f"""select dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code,
+			sum(dni.qty), sum(dni.amount)
+			from `tabDelivery Note Item` dni
+			join `tabDelivery Note` dn on dn.name = dni.parent
+			where {where}
+			group by dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code""",
+		params,
+	)
+	grand, net = frappe.db.sql(
+		f"select sum(dn.grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
+		params,
+	)[0]
+	return _billable_net(customer, rows) * (flt(grand) / flt(net) if flt(net) else 1.0)
+
+
+def _doc_dn_value(doc):
+	"""Same valuation for one in-memory Delivery Note (the one being validated)."""
+	rows = [
+		(i.so_detail, i.against_sales_order, doc.posting_date, i.item_code, flt(i.qty), flt(i.amount))
+		for i in doc.items
+	]
+	net = flt(doc.net_total)
+	vat = flt(doc.grand_total) / net if net else 1.0
+	return _billable_net(doc.customer, rows, doc.posting_date) * vat
 
 
 def customer_delivered_total(customer, start_date=None):
-	"""Sum of Delivery Note grand_total (draft + submitted) for the customer,
-	counting only DNs posted on or after the wallet start date."""
+	"""Deal-discounted value of the customer's Delivery Notes (draft + submitted)
+	posted on or after the wallet start date."""
 	if start_date is None:
 		start_date = _wallet_start_date(customer)
-	rows = frappe.db.get_all(
-		"Delivery Note",
-		filters=_dn_filters(customer, start_date, docstatus=["in", [0, 1]]),
-		fields=["grand_total"],
-	)
-	return sum((d.grand_total or 0) for d in rows)
+	return _tracked_dn_value(customer, start_date, (0, 1))
 
 
 def recompute_from_deliveries(wallet_name, customer):
@@ -213,14 +302,13 @@ def enforce_wallet_balance(doc, method=None):
 	# dn_amount below. We recompute these two sums from live DNs instead of reusing the stored
 	# amount_remaining, which already nets ALL drafts (incl. this one on a re-save) and would
 	# double-count them — the bug that spuriously blocked a legitimate qty edit.
-	def _dn_sum(filters):
-		return sum(flt(d.grand_total) for d in frappe.get_all("Delivery Note", filters=filters, fields=["grand_total"]))
-
+	# All three are valued as the invoice will bill them (see _billable_net): Force
+	# Majeure flat rates and the deal discount, not the raw DN grand_total.
 	start = wallet.wallet_start_date
-	committed = _dn_sum(_dn_filters(doc.customer, start, docstatus=1))
-	other_drafts = _dn_sum(_dn_filters(doc.customer, start, docstatus=0, name=["!=", doc.name or ""]))
+	committed = _tracked_dn_value(doc.customer, start, (1,))
+	other_drafts = _tracked_dn_value(doc.customer, start, (0,), exclude=doc.name or "")
 	available = flt(wallet.amount_received) - committed - other_drafts
-	dn_amount = flt(doc.grand_total)
+	dn_amount = _doc_dn_value(doc)
 
 	if (available - dn_amount) >= 0:
 		return
@@ -257,7 +345,8 @@ def enforce_wallet_balance(doc, method=None):
 		description = (
 			"Customer: " + str(doc.customer) + "<br>"
 			"Wallet Start Date: " + str(wallet.wallet_start_date) + "<br>"
-			"DN Amount: " + str(dn_amount) + "<br>"
+			"DN Amount (as billable): " + str(dn_amount) + "<br>"
+			"DN Grand Total: " + str(flt(doc.grand_total)) + "<br>"
 			"Wallet Received: " + str(flt(wallet.amount_received)) + "<br>"
 			"Committed (submitted DNs): " + str(committed) + "<br>"
 			"Open Drafts Reserved (others): " + str(other_drafts) + "<br>"
