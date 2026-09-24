@@ -145,7 +145,10 @@ _WALLET = "fuelbuddy_wallet.fuelbuddy_wallet.doctype.wallet.wallet"
 doc_events = {
 	# Per team convention: one submit-side and one cancel-side handler per doctype.
 	"Delivery Note": {
-		"validate": f"{_WALLET}.enforce_wallet_balance",
+		# before_save, NOT validate: Frappe runs validate on submit too, and a delivered
+		# DN must never be stranded in draft by the wallet. before_save fires only for
+		# draft insert / draft re-save (incl. amendments), which is exactly the punch path.
+		"before_save": f"{_WALLET}.enforce_wallet_balance",
 		"on_update": f"{_WALLET}.update_wallet_on_delivery_note",
 		# Reverse a DN's wallet impact when it leaves the delivered set:
 		#   on_cancel   -- submitted DN 1->2 (docstatus 2 no longer counted)

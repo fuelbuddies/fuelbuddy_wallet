@@ -270,9 +270,11 @@ def reconcile_wallet(wallet_name, apply=0):
 
 
 def enforce_wallet_balance(doc, method=None):
-	"""Delivery Note `validate` (was "Delivery Note Wallet blocker", Before Save).
+	"""Delivery Note `before_save` (was "Delivery Note Wallet blocker", Before Save).
 
-	Block a Delivery Note that would push the customer's wallet below zero --
+	Runs on draft insert and draft re-save only -- never on submit, where Frappe
+	would otherwise re-run a `validate` hook and could strand an already-delivered
+	DN in draft. Block a Delivery Note that would push the customer's wallet below zero --
 	accounting for other open drafts already reserving the balance -- unless an
 	active breach allowance covers the shortfall. On a hard block, raise a
 	support Issue (in its own transaction so it survives the rollback) and throw.
