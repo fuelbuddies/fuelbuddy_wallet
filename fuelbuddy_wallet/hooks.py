@@ -156,12 +156,6 @@ doc_events = {
 		"on_cancel": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
 		"after_delete": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
 	},
-	# SI and PE both move the customer's GL, which received is derived from —
-	# submit AND cancel each refresh the wallet (bulk cancel included).
-	"Sales Invoice": {
-		"on_submit": f"{_WALLET}.update_wallet_on_sales_invoice_submit",
-		"on_cancel": f"{_WALLET}.update_wallet_on_sales_invoice_cancel",
-	},
 	"Payment Entry": {
 		"on_submit": f"{_WALLET}.update_wallet_on_payment_entry_submit",
 		"on_cancel": f"{_WALLET}.update_wallet_on_payment_entry_cancel",
