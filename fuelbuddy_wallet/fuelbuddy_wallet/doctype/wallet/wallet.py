@@ -54,7 +54,7 @@ class Wallet(Document):
 			self.date_of_breach = now_datetime()
 
 	def on_update(self):
-		if self.has_value_changed("wallet_start_date"):
+		if self.has_value_changed("wallet_start_date") or self.has_value_changed("opening_balance"):
 			recompute_from_deliveries(self.name, self.customer)
 
 
@@ -71,10 +71,14 @@ def get_customer_wallet(customer):
 
 
 def customer_payments_total(customer, start_date=None):
-	"""Submitted Payment Entries from the wallet start date, company currency:
-	Receive adds, Pay (refund) subtracts."""
+	"""Wallet opening balance + submitted Payment Entries from the wallet start
+	date, company currency: Receive adds, Pay (refund) subtracts."""
+	w = frappe.db.get_value(
+		"Wallet", {"customer": customer, "payment_type": "Wallet"},
+		["wallet_start_date", "opening_balance"], as_dict=True,
+	) or {}
 	if start_date is None:
-		start_date = _wallet_start_date(customer)
+		start_date = w.get("wallet_start_date")
 	filters = {"docstatus": 1, "party_type": "Customer", "party": customer}
 	if start_date:
 		filters["posting_date"] = [">=", start_date]
@@ -86,7 +90,7 @@ def customer_payments_total(customer, start_date=None):
 			total += flt(pe.base_received_amount)
 		elif pe.payment_type == "Pay":
 			total -= flt(pe.base_paid_amount)
-	return total
+	return flt(w.get("opening_balance")) + total
 
 
 def _wallet_start_date(customer):
