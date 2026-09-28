@@ -67,16 +67,17 @@ def get_customer_wallet(customer):
 
 
 def customer_gl_balance(customer):
-	"""Net GL balance (credit - debit) over non-cancelled GL Entries for the customer."""
+	"""Net GL balance (credit - debit) over non-cancelled GL Entries for the customer.
+
+	Company currency (``credit`` / ``debit``), not ``*_in_account_currency``: a customer
+	with a foreign-currency receivable account would otherwise have received in USD but
+	delivered in AED (DN base totals). Same convention as fuelbuddy_creditlimit."""
 	rows = frappe.db.get_all(
 		"GL Entry",
 		filters={"is_cancelled": 0, "party_type": "Customer", "party": customer},
-		fields=["credit_in_account_currency", "debit_in_account_currency"],
+		fields=["credit", "debit"],
 	)
-	ledger = 0.0
-	for r in rows:
-		ledger += (r.credit_in_account_currency or 0) - (r.debit_in_account_currency or 0)
-	return ledger
+	return sum(flt(r.credit) - flt(r.debit) for r in rows)
 
 
 def _wallet_start_date(customer):
@@ -156,9 +157,13 @@ def _billable_net(customer, rows, as_on=None):
 
 
 def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
-	"""Grand-total value (incl. VAT) of the customer's wallet-tracked Delivery
-	Notes as they will be billed: quantities valued by _billable_net, VAT put
-	back at the set's own grand/net ratio."""
+	"""Grand-total value (incl. VAT, company currency) of the customer's
+	wallet-tracked Delivery Notes as they will be billed: quantities valued by
+	_billable_net (transaction currency), then VAT and currency conversion put
+	back in one step at the set's own base_grand/net ratio.
+
+	# ponytail: one ratio over the whole set assumes a customer transacts in one
+	# currency; per-DN conversion_rate in the group-by if that ever changes."""
 	where, params = _dn_where(customer, start_date, docstatus, exclude)
 	rows = frappe.db.sql(
 		f"""select dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code,
@@ -170,7 +175,7 @@ def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
 		params,
 	)
 	grand, net = frappe.db.sql(
-		f"select sum(dn.grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
+		f"select sum(dn.base_grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
 		params,
 	)[0]
 	return _billable_net(customer, rows) * (flt(grand) / flt(net) if flt(net) else 1.0)
@@ -183,7 +188,7 @@ def _doc_dn_value(doc):
 		for i in doc.items
 	]
 	net = flt(doc.net_total)
-	vat = flt(doc.grand_total) / net if net else 1.0
+	vat = flt(doc.base_grand_total) / net if net else 1.0  # VAT + conversion, as above
 	return _billable_net(doc.customer, rows, doc.posting_date) * vat
 
 
@@ -281,6 +286,10 @@ def enforce_wallet_balance(doc, method=None):
 	"""
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
+	# for_update: serialize concurrent DN saves for this customer on the wallet row. Without
+	# it two deliveries read the same committed/other_drafts, both pass, and the wallet goes
+	# negative (TOCTOU). Held to the end of this transaction; a competing save waits, then
+	# recomputes with this DN already in the draft set. Same pattern as creditlimit.
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
@@ -289,6 +298,7 @@ def enforce_wallet_balance(doc, method=None):
 			"date_of_breach", "wallet_start_date",
 		],
 		as_dict=True,
+		for_update=True,
 	)
 	if not wallet:
 		return
