@@ -149,6 +149,8 @@ doc_events = {
 		# DN must never be stranded in draft by the wallet. before_save fires only for
 		# draft insert / draft re-save (incl. amendments), which is exactly the punch path.
 		"before_save": f"{_WALLET}.enforce_wallet_balance",
+		# A DN inserted already submitted skips before_save; the handler ignores normal submits.
+		"before_submit": f"{_WALLET}.enforce_wallet_balance",
 		"on_update": f"{_WALLET}.update_wallet_on_delivery_note",
 		# Reverse a DN's wallet impact when it leaves the delivered set:
 		#   on_cancel   -- submitted DN 1->2 (docstatus 2 no longer counted)
