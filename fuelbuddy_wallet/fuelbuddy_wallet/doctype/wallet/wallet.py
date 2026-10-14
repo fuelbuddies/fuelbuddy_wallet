@@ -52,10 +52,12 @@ class Wallet(Document):
 		# shows on the form immediately (cleaner than a post-save on_update write).
 		if self.enable_breach and self.has_value_changed("enable_breach"):
 			self.date_of_breach = now_datetime()
-
-	def on_update(self):
+		# Set on the doc so the save writes them: a post-save set_value left the form stale
+		# and its next save failed with TimestampMismatchError.
 		if self.has_value_changed("wallet_start_date") or self.has_value_changed("opening_balance"):
-			recompute_from_deliveries(self.name, self.customer)
+			self.amount_received = customer_payments_total(self.customer, self.wallet_start_date, flt(self.opening_balance))
+			self.amount_delivered = customer_delivered_total(self.customer, self.wallet_start_date)
+			self.amount_remaining = self.amount_received - self.amount_delivered
 
 
 # -- balance helpers ---------------------------------------------------------
@@ -70,15 +72,18 @@ def get_customer_wallet(customer):
 	)
 
 
-def customer_payments_total(customer, start_date=None):
+def customer_payments_total(customer, start_date=None, opening_balance=None):
 	"""Wallet opening balance + submitted Payment Entries from the wallet start
-	date, company currency: Receive adds, Pay (refund) subtracts."""
+	date, company currency: Receive adds, Pay (refund) subtracts. Values not
+	passed are read from the customer's wallet."""
 	w = frappe.db.get_value(
 		"Wallet", {"customer": customer, "payment_type": "Wallet"},
 		["wallet_start_date", "opening_balance"], as_dict=True,
 	) or {}
 	if start_date is None:
 		start_date = w.get("wallet_start_date")
+	if opening_balance is None:
+		opening_balance = w.get("opening_balance")
 	filters = {"docstatus": 1, "party_type": "Customer", "party": customer}
 	if start_date:
 		filters["posting_date"] = [">=", start_date]
@@ -90,7 +95,7 @@ def customer_payments_total(customer, start_date=None):
 			total += flt(pe.base_received_amount)
 		elif pe.payment_type == "Pay":
 			total -= flt(pe.base_paid_amount)
-	return flt(w.get("opening_balance")) + total
+	return flt(opening_balance) + total
 
 
 def _wallet_start_date(customer):
