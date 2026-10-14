@@ -462,6 +462,54 @@ def update_wallet_on_payment_entry_cancel(doc, method=None):
 		_recompute_received_for_customer(doc.party)
 
 
+def _revalue_wallets_for_force_majeure(customers):
+	"""Shared body of the Force Majeure handlers: FM re-prices deliveries these customers'
+	wallets already counted, so reconcile those wallets in a worker after the commit (a
+	change that rolls back, e.g. a cancel refused by an invoice back-link, queues nothing)."""
+	if not _wallet_enabled():
+		return
+	for customer in set(customers):
+		# The row every DN/PE handler reads; a duplicate row must not become the live one.
+		wallet = get_customer_wallet(customer)
+		if wallet:
+			# reconcile, not recompute: it locks the wallet row before reading, so a DN save
+			# in flight isn't overwritten.
+			# ponytail: a DN save that read before the FM commit and writes after this job puts
+			# old numbers back; that customer's next DN event or a Reconcile fixes it.
+			frappe.enqueue(reconcile_wallet, wallet_name=wallet, apply=1, enqueue_after_commit=True)
+
+
+def _customers_with_force_majeure_pricing():
+	"""A Trigger (or the FM switch) gates every customer holding an approved Pricing."""
+	return frappe.get_all("Force Majeure Pricing", filters={"docstatus": 1}, pluck="customer")
+
+
+def revalue_wallets_on_force_majeure_pricing(doc, method=None):
+	"""Force Majeure Pricing `on_submit` (Approve) / `on_update_after_submit` (Effective End edit)."""
+	_revalue_wallets_for_force_majeure([doc.customer])
+
+
+def revalue_wallets_on_force_majeure_pricing_cancel(doc, method=None):
+	"""Force Majeure Pricing `on_cancel`."""
+	_revalue_wallets_for_force_majeure([doc.customer])
+
+
+def revalue_wallets_on_force_majeure_trigger(doc, method=None):
+	"""Force Majeure Trigger `on_submit`."""
+	_revalue_wallets_for_force_majeure(_customers_with_force_majeure_pricing())
+
+
+def revalue_wallets_on_force_majeure_trigger_cancel(doc, method=None):
+	"""Force Majeure Trigger `on_cancel`."""
+	_revalue_wallets_for_force_majeure(_customers_with_force_majeure_pricing())
+
+
+def revalue_wallets_on_force_majeure_switch(doc, method=None):
+	"""Fuelbuddy Settings `on_update`: turning Force Majeure on or off re-prices like a Trigger."""
+	if doc.has_value_changed("enable_force_majeure"):
+		_revalue_wallets_for_force_majeure(_customers_with_force_majeure_pricing())
+
+
 def create_wallet_for_customer(doc, method=None):
 	"""Customer `after_insert`: auto-create a Wallet when the new customer is on
 	Cash-advance terms. Skips if a wallet already exists for the customer.

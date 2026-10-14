@@ -165,6 +165,20 @@ doc_events = {
 	"Customer": {
 		"after_insert": f"{_WALLET}.create_wallet_for_customer",
 	},
+	# Force Majeure (fuelbuddy_crm) re-prices deliveries the wallet already counted.
+	"Force Majeure Pricing": {
+		"on_submit": f"{_WALLET}.revalue_wallets_on_force_majeure_pricing",
+		# An Effective End edit, the only change allowed after approval.
+		"on_update_after_submit": f"{_WALLET}.revalue_wallets_on_force_majeure_pricing",
+		"on_cancel": f"{_WALLET}.revalue_wallets_on_force_majeure_pricing_cancel",
+	},
+	"Force Majeure Trigger": {
+		"on_submit": f"{_WALLET}.revalue_wallets_on_force_majeure_trigger",
+		"on_cancel": f"{_WALLET}.revalue_wallets_on_force_majeure_trigger_cancel",
+	},
+	"Fuelbuddy Settings": {
+		"on_update": f"{_WALLET}.revalue_wallets_on_force_majeure_switch",
+	},
 }
 
 # Scheduled Tasks
