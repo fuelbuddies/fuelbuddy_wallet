@@ -299,10 +299,8 @@ def enforce_wallet_balance(doc, method=None):
 	"""
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
-	# for_update: serialize concurrent DN saves for this customer on the wallet row. Without
-	# it two deliveries read the same committed/other_drafts, both pass, and the wallet goes
-	# negative (TOCTOU). Held to the end of this transaction; a competing save waits, then
-	# recomputes with this DN already in the draft set. Same pattern as creditlimit.
+	# No FOR UPDATE: on unindexed customer it locked every Wallet row, it deadlocked with DN
+	# submits, and under REPEATABLE READ the sums below still came from the pre-lock snapshot.
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
@@ -311,7 +309,6 @@ def enforce_wallet_balance(doc, method=None):
 			"date_of_breach", "wallet_start_date",
 		],
 		as_dict=True,
-		for_update=True,
 	)
 	if not wallet:
 		return
