@@ -53,6 +53,10 @@ class Wallet(Document):
 		if self.enable_breach and self.has_value_changed("enable_breach"):
 			self.date_of_breach = now_datetime()
 
+	def on_update(self):
+		if self.has_value_changed("wallet_start_date") or self.has_value_changed("opening_balance"):
+			recompute_from_deliveries(self.name, self.customer)
+
 
 # -- balance helpers ---------------------------------------------------------
 
@@ -66,17 +70,27 @@ def get_customer_wallet(customer):
 	)
 
 
-def customer_gl_balance(customer):
-	"""Net GL balance (credit - debit) over non-cancelled GL Entries for the customer."""
-	rows = frappe.db.get_all(
-		"GL Entry",
-		filters={"is_cancelled": 0, "party_type": "Customer", "party": customer},
-		fields=["credit_in_account_currency", "debit_in_account_currency"],
-	)
-	ledger = 0.0
-	for r in rows:
-		ledger += (r.credit_in_account_currency or 0) - (r.debit_in_account_currency or 0)
-	return ledger
+def customer_payments_total(customer, start_date=None):
+	"""Wallet opening balance + submitted Payment Entries from the wallet start
+	date, company currency: Receive adds, Pay (refund) subtracts."""
+	w = frappe.db.get_value(
+		"Wallet", {"customer": customer, "payment_type": "Wallet"},
+		["wallet_start_date", "opening_balance"], as_dict=True,
+	) or {}
+	if start_date is None:
+		start_date = w.get("wallet_start_date")
+	filters = {"docstatus": 1, "party_type": "Customer", "party": customer}
+	if start_date:
+		filters["posting_date"] = [">=", start_date]
+	total = 0.0
+	for pe in frappe.get_all(
+		"Payment Entry", filters=filters, fields=["payment_type", "base_paid_amount", "base_received_amount"]
+	):
+		if pe.payment_type == "Receive":
+			total += flt(pe.base_received_amount)
+		elif pe.payment_type == "Pay":
+			total -= flt(pe.base_paid_amount)
+	return flt(w.get("opening_balance")) + total
 
 
 def _wallet_start_date(customer):
@@ -156,9 +170,13 @@ def _billable_net(customer, rows, as_on=None):
 
 
 def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
-	"""Grand-total value (incl. VAT) of the customer's wallet-tracked Delivery
-	Notes as they will be billed: quantities valued by _billable_net, VAT put
-	back at the set's own grand/net ratio."""
+	"""Grand-total value (incl. VAT, company currency) of the customer's
+	wallet-tracked Delivery Notes as they will be billed: quantities valued by
+	_billable_net (transaction currency), then VAT and currency conversion put
+	back in one step at the set's own base_grand/net ratio.
+
+	# ponytail: one ratio over the whole set assumes a customer transacts in one
+	# currency; per-DN conversion_rate in the group-by if that ever changes."""
 	where, params = _dn_where(customer, start_date, docstatus, exclude)
 	rows = frappe.db.sql(
 		f"""select dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code,
@@ -170,7 +188,7 @@ def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
 		params,
 	)
 	grand, net = frappe.db.sql(
-		f"select sum(dn.grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
+		f"select sum(dn.base_grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
 		params,
 	)[0]
 	return _billable_net(customer, rows) * (flt(grand) / flt(net) if flt(net) else 1.0)
@@ -183,7 +201,7 @@ def _doc_dn_value(doc):
 		for i in doc.items
 	]
 	net = flt(doc.net_total)
-	vat = flt(doc.grand_total) / net if net else 1.0
+	vat = flt(doc.base_grand_total) / net if net else 1.0  # VAT + conversion, as above
 	return _billable_net(doc.customer, rows, doc.posting_date) * vat
 
 
@@ -196,35 +214,35 @@ def customer_delivered_total(customer, start_date=None):
 
 
 def recompute_from_deliveries(wallet_name, customer):
-	"""Refresh received / delivered / remaining from GL and Delivery Notes."""
-	ledger = customer_gl_balance(customer)
+	"""Refresh received / delivered / remaining from Payment Entries and Delivery Notes."""
+	received = customer_payments_total(customer)
 	delivered = customer_delivered_total(customer)
 	frappe.db.set_value(
 		"Wallet",
 		wallet_name,
 		{
-			"amount_received": ledger,
+			"amount_received": received,
 			"amount_delivered": delivered,
-			"amount_remaining": ledger - delivered,
+			"amount_remaining": received - delivered,
 		},
 	)
 
 
 def recompute_received(wallet_name):
-	"""Refresh received (and remaining, against the stored delivered) from GL."""
+	"""Refresh received (and remaining, against the stored delivered) from Payment Entries."""
 	customer = frappe.db.get_value("Wallet", wallet_name, "customer")
-	ledger = customer_gl_balance(customer)
+	received = customer_payments_total(customer)
 	delivered = flt(frappe.db.get_value("Wallet", wallet_name, "amount_delivered"))
 	frappe.db.set_value(
 		"Wallet",
 		wallet_name,
-		{"amount_received": ledger, "amount_remaining": ledger - delivered},
+		{"amount_received": received, "amount_remaining": received - delivered},
 	)
 
 
 @frappe.whitelist()
 def reconcile_wallet(wallet_name, apply=0):
-	"""Check the stored received / delivered / remaining against live GL and
+	"""Check the stored received / delivered / remaining against live Payment Entry and
 	Delivery Note totals; with ``apply=1`` correct them in place.
 
 	Safety net for bulk submit / cancel flows: every event handler recomputes
@@ -244,12 +262,12 @@ def reconcile_wallet(wallet_name, apply=0):
 	)
 	if not w:
 		frappe.throw(f"Wallet {wallet_name} not found")
-	ledger = customer_gl_balance(w.customer)
+	received = customer_payments_total(w.customer)
 	delivered = customer_delivered_total(w.customer)
 	expected = {
-		"amount_received": ledger,
+		"amount_received": received,
 		"amount_delivered": delivered,
-		"amount_remaining": ledger - delivered,
+		"amount_remaining": received - delivered,
 	}
 	stored = {k: flt(w.get(k)) for k in expected}
 	in_sync = all(abs(stored[k] - flt(expected[k])) < 0.005 for k in expected)
@@ -270,15 +288,21 @@ def reconcile_wallet(wallet_name, apply=0):
 
 
 def enforce_wallet_balance(doc, method=None):
-	"""Delivery Note `validate` (was "Delivery Note Wallet blocker", Before Save).
+	"""Delivery Note `before_save` (was "Delivery Note Wallet blocker", Before Save).
 
-	Block a Delivery Note that would push the customer's wallet below zero --
+	Runs on draft insert and draft re-save only -- never on submit, where Frappe
+	would otherwise re-run a `validate` hook and could strand an already-delivered
+	DN in draft. Block a Delivery Note that would push the customer's wallet below zero --
 	accounting for other open drafts already reserving the balance -- unless an
 	active breach allowance covers the shortfall. On a hard block, raise a
 	support Issue (in its own transaction so it survives the rollback) and throw.
 	"""
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
+	# for_update: serialize concurrent DN saves for this customer on the wallet row. Without
+	# it two deliveries read the same committed/other_drafts, both pass, and the wallet goes
+	# negative (TOCTOU). Held to the end of this transaction; a competing save waits, then
+	# recomputes with this DN already in the draft set. Same pattern as creditlimit.
 	wallet = frappe.db.get_value(
 		"Wallet",
 		{"customer": doc.customer, "payment_type": "Wallet"},
@@ -287,6 +311,7 @@ def enforce_wallet_balance(doc, method=None):
 			"date_of_breach", "wallet_start_date",
 		],
 		as_dict=True,
+		for_update=True,
 	)
 	if not wallet:
 		return
@@ -364,6 +389,11 @@ def enforce_wallet_balance(doc, method=None):
 				"priority": "High",
 				"issue_type": "Error Log",
 				"description": description,
+				# Same identity fields erp-functions stamps on its Issues, so ops can trace
+				# the blocked punch back to the Hasura invoiced_item / order.
+				"customer": doc.customer,
+				"custom_invoice_item_id": doc.get("custom_invoiced_item_id"),
+				"custom_order_code": doc.get("custom_order_code"),
 			},
 		)
 
@@ -404,8 +434,8 @@ def update_wallet_on_delivery_note_cancel(doc, method=None):
 
 
 def _recompute_received_for_customer(customer):
-	"""Shared body of the SI / PE handlers: both doctypes only move the customer's
-	GL, so their submit AND cancel refresh received (and remaining) from GL."""
+	"""Shared body of the Payment Entry handlers: submit AND cancel refresh received
+	(and remaining) from the customer's Payment Entries."""
 	if not _wallet_enabled():
 		return
 	wallet = get_customer_wallet(customer)
@@ -420,24 +450,11 @@ def update_wallet_on_payment_entry_submit(doc, method=None):
 
 
 def update_wallet_on_payment_entry_cancel(doc, method=None):
-	"""Payment Entry `on_cancel`: the payment's GL entries are cancelled, so the
+	"""Payment Entry `on_cancel`: the payment leaves the submitted set, so the
 	wallet's received must drop — without this, a cancelled (e.g. bulk-cancelled)
 	PE leaves amount_received inflated until an unrelated event recomputes."""
 	if doc.party_type == "Customer":
 		_recompute_received_for_customer(doc.party)
-
-
-def update_wallet_on_sales_invoice_submit(doc, method=None):
-	"""Sales Invoice `on_submit`: SI writes customer GL debits, which change the
-	net GL balance the wallet's received is derived from."""
-	if doc.get("customer"):
-		_recompute_received_for_customer(doc.customer)
-
-
-def update_wallet_on_sales_invoice_cancel(doc, method=None):
-	"""Sales Invoice `on_cancel`: the SI's GL entries are cancelled; refresh."""
-	if doc.get("customer"):
-		_recompute_received_for_customer(doc.customer)
 
 
 def create_wallet_for_customer(doc, method=None):
