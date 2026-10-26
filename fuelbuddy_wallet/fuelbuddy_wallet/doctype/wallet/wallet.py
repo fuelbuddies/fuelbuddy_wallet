@@ -288,15 +288,17 @@ def reconcile_wallet(wallet_name, apply=0):
 
 
 def enforce_wallet_balance(doc, method=None):
-	"""Delivery Note `before_save` (was "Delivery Note Wallet blocker", Before Save).
+	"""Delivery Note `before_save` and `before_submit` (was "Delivery Note Wallet blocker", Before Save).
 
-	Runs on draft insert and draft re-save only -- never on submit, where Frappe
-	would otherwise re-run a `validate` hook and could strand an already-delivered
-	DN in draft. Block a Delivery Note that would push the customer's wallet below zero --
-	accounting for other open drafts already reserving the balance -- unless an
+	Runs only when a Delivery Note is first punched: a new DN that is neither an amendment nor a
+	return, inserted as a draft or already submitted. Every later save, submit and amendment skips
+	it, so a delivered DN is never stranded. Block a Delivery Note that would push the customer's
+	wallet below zero -- accounting for other open drafts already reserving the balance -- unless an
 	active breach allowance covers the shortfall. On a hard block, raise a
 	support Issue (in its own transaction so it survives the rollback) and throw.
 	"""
+	if not doc.flags.in_insert or doc.amended_from or doc.is_return:
+		return  # not the first punch: a re-save, the submit of a draft, an amendment or a return
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
 	# for_update: serialize concurrent DN saves for this customer on the wallet row. Without
