@@ -585,8 +585,8 @@ def _live_entries(**filters):
 	cond = " and ".join(f"`{k}` = %({k})s" for k in filters)
 	return frappe.db.sql(
 		f"""select name, customer, voucher_type, voucher_no, amount, posting_date, is_submitted,
-			force_majeure from `tabWallet Ledger Entry` where is_cancelled = 0 and {cond}
-			order by creation""",
+			force_majeure, force_majeure_change_date from `tabWallet Ledger Entry`
+			where is_cancelled = 0 and {cond} order by creation""",
 		filters,
 		as_dict=True,
 	)
@@ -627,6 +627,7 @@ def _sync_voucher(live, customer, voucher_type, voucher_no, target, revalue=Fals
 				"amount": amount,
 				"is_submitted": is_submitted,
 				"force_majeure": cint(fm),
+				"force_majeure_change_date": nowdate() if fm else None,
 			}
 		)
 		doc.flags.from_wallet = doc.flags.ignore_permissions = True
@@ -634,20 +635,32 @@ def _sync_voucher(live, customer, voucher_type, voucher_no, target, revalue=Fals
 		doc.submit()
 		return
 	moved = abs(flt(keep.amount) - flt(amount)) > 1e-6
-	if not moved and (getdate(keep.posting_date), cint(keep.is_submitted), cint(keep.force_majeure)) == (
-		getdate(posting_date),
-		cint(is_submitted),
-		cint(fm),
-	):
+	before = (getdate(keep.posting_date), cint(keep.is_submitted), cint(keep.force_majeure))
+	if not moved and before == (getdate(posting_date), cint(is_submitted), cint(fm)) and (
+		keep.force_majeure_change_date and getdate(keep.force_majeure_change_date)
+	) == _fm_date(keep, fm, moved, revalue):
 		return
 	doc = frappe.get_doc(LEDGER, keep.name, for_update=True)
-	# a Force Majeure revaluation, not a quantity edit on an FM-priced DN
-	if moved and (cint(fm) != cint(doc.force_majeure) or (revalue and (fm or doc.force_majeure))):
-		doc.force_majeure_change_date = nowdate()
+	moved = abs(flt(doc.amount) - flt(amount)) > 1e-6  # the locked row, not the plain read
 	doc.update(
-		{"amount": amount, "posting_date": posting_date, "is_submitted": is_submitted, "force_majeure": cint(fm)}
+		{
+			"amount": amount,
+			"posting_date": posting_date,
+			"is_submitted": is_submitted,
+			"force_majeure": cint(fm),
+			"force_majeure_change_date": _fm_date(doc, fm, moved, revalue),
+		}
 	)
 	_save_entry(doc)
+
+
+def _fm_date(entry, fm, moved, revalue):
+	"""FM date after this write: set while FM prices the entry, re-dated when FM starts or a Reconcile re-values it, cleared when FM stops."""
+	if not fm:
+		return None
+	if (moved and revalue) or not cint(entry.force_majeure) or not entry.force_majeure_change_date:
+		return getdate(nowdate())
+	return getdate(entry.force_majeure_change_date)
 
 
 def post_to_wallet_ledger(doc, values=None):

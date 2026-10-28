@@ -119,7 +119,7 @@
   },
   {
    "allow_on_submit": 1,
-   "description": "Day a Force Majeure revaluation last changed the amount.",
+   "description": "Day Force Majeure pricing was applied to the amount, or a Reconcile last re-valued it; empty when Force Majeure does not apply.",
    "fieldname": "force_majeure_change_date",
    "fieldtype": "Date",
    "label": "Force Majeure Change Date",
