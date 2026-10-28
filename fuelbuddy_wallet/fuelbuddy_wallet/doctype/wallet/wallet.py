@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, time_diff_in_seconds, today
 
 # Hours a breach stays open before it auto-closes (once the wallet has recovered).
 BREACH_WINDOW_HOURS = 12
@@ -473,6 +473,8 @@ def create_wallet_for_customer(doc, method=None):
 			"customer": doc.name,
 			"payment_terms": doc.payment_terms,
 			"payment_type": "Wallet",
+			# Data Import skips doctype defaults (frappe.flags.in_import), so set it here.
+			"wallet_start_date": today(),
 		}
 	).insert(ignore_permissions=True)
 
