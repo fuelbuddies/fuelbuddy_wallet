@@ -45,6 +45,19 @@ def _wallet_enabled():
 
 
 class Wallet(Document):
+	def validate(self):
+		# One wallet per customer: the DN blocker, the recompute and the ledger all key on it.
+		if self.payment_type == "Wallet" and (
+			self.has_value_changed("customer") or self.has_value_changed("payment_type")
+		):
+			other = frappe.db.get_value(
+				"Wallet",
+				{"customer": self.customer, "payment_type": "Wallet", "name": ["!=", self.name or ""]},
+				"name",
+			)
+			if other:
+				frappe.throw(f"Customer {self.customer} already has Wallet {other}.")
+
 	def before_save(self):
 		# When breach is (re)enabled, stamp date_of_breach = now so the 12h window
 		# (close_expired_breaches + the Delivery Note blocker) is measured from the
