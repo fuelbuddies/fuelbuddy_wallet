@@ -3,7 +3,7 @@
 
 import frappe
 from frappe import _
-from frappe.utils import flt, getdate
+from frappe.utils import cint, flt, getdate
 
 
 def execute(filters=None):
@@ -16,6 +16,23 @@ def execute(filters=None):
 	if filters.submitted_only:
 		cond.append("is_submitted = 1")
 	cond = " and ".join(cond)
+	filters.cancelled = cint(filters.cancelled_only)
+
+	entries = frappe.db.sql(
+		f"""select name, posting_date, customer, voucher_type, voucher_no, amount, is_submitted,
+			is_cancelled, force_majeure_change_date
+		from `tabWallet Ledger Entry`
+		where posting_date between %(from_date)s and %(to_date)s and is_cancelled = %(cancelled)s and {cond}
+		order by posting_date, creation""",
+		filters,
+		as_dict=True,
+	)
+	for e in entries:
+		e.update(_credit_debit(e.amount), currency=currency)
+	credit, debit = sum(e.credit for e in entries), sum(e.debit for e in entries)
+	if filters.cancelled:
+		# cancelled entries count in no balance: listed with their own total only
+		return _columns(), entries + [_total_row(_("Total"), None, credit, debit, currency)]
 
 	opening = flt(
 		frappe.db.sql(
@@ -24,30 +41,22 @@ def execute(filters=None):
 			filters,
 		)[0][0]
 	)
-	entries = frappe.db.sql(
-		f"""select name, posting_date, customer, voucher_type, voucher_no, amount, is_submitted,
-			is_cancelled, force_majeure_change_date
-		from `tabWallet Ledger Entry`
-		where posting_date between %(from_date)s and %(to_date)s and {cond}
-			{"" if filters.show_cancelled_entries else "and is_cancelled = 0"}
-		order by posting_date, creation""",
-		filters,
-		as_dict=True,
-	)
-	data = [_total_row(_("Opening"), opening, max(opening, 0), max(-opening, 0), currency)]
 	balance = opening
-	credit = debit = 0.0
 	for e in entries:
-		amount = 0.0 if e.is_cancelled else flt(e.amount)  # listed, never counted
-		balance += amount
-		credit += max(amount, 0)
-		debit += max(-amount, 0)
-		e.update(credit=max(flt(e.amount), 0), debit=max(-flt(e.amount), 0), balance=balance, currency=currency)
-		data.append(e)
-	data.append(_total_row(_("Total"), credit - debit, credit, debit, currency))
+		balance += flt(e.amount)
+		e.balance = balance
 	closing = opening + credit - debit
-	data.append(_total_row(_("Closing (Opening + Total)"), closing, max(closing, 0), max(-closing, 0), currency))
-	return _columns(), data
+	return _columns(), [
+		_total_row(_("Opening"), opening, **_credit_debit(opening), currency=currency),
+		*entries,
+		_total_row(_("Total"), credit - debit, credit, debit, currency),
+		_total_row(_("Closing (Opening + Total)"), closing, **_credit_debit(closing), currency=currency),
+	]
+
+
+def _credit_debit(amount):
+	amount = flt(amount)
+	return {"credit": amount if amount > 0 else 0.0, "debit": -amount if amount < 0 else 0.0}
 
 
 def _total_row(label, balance, credit, debit, currency):

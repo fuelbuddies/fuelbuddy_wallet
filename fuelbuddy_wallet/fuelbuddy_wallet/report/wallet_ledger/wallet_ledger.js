@@ -28,7 +28,7 @@ frappe.query_reports["Wallet Ledger"] = {
 		{ fieldname: "customer", label: __("Customer"), fieldtype: "Link", options: "Customer" },
 		{ fieldname: "voucher_type", label: __("Voucher Type"), fieldtype: "Link", options: "DocType" },
 		{ fieldname: "voucher_no", label: __("Voucher No"), fieldtype: "Data" },
-		{ fieldname: "show_cancelled_entries", label: __("Show Cancelled Entries"), fieldtype: "Check" },
+		{ fieldname: "cancelled_only", label: __("Cancelled Only"), fieldtype: "Check" },
 		{ fieldname: "submitted_only", label: __("Submitted Only"), fieldtype: "Check" },
 	],
 };
