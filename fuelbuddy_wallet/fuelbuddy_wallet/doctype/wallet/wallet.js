@@ -41,10 +41,16 @@ function show_wallet_reconcile(frm, res) {
 			</tr>`;
 		})
 		.join("");
+	const ledger_bad = Math.abs(res.ledger_total - res.expected.amount_remaining) >= 0.005;
+	const ledger_row = `<tr${ledger_bad ? ' style="color:var(--red-600);font-weight:600;"' : ""}>
+		<td>${__("Wallet Ledger Balance")}</td>
+		<td style="text-align:right">${fmt(res.ledger_total)}</td>
+		<td style="text-align:right">${fmt(res.expected.amount_remaining)}</td>
+	</tr>`;
 	const table = `<table class="table table-bordered">
 		<thead><tr><th></th><th style="text-align:right">${__("Stored")}</th>
 		<th style="text-align:right">${__("Live Transactions")}</th></tr></thead>
-		<tbody>${rows}</tbody></table>`;
+		<tbody>${rows}${ledger_row}</tbody></table>`;
 
 	if (res.in_sync) {
 		frappe.msgprint({ title: __("Wallet is in sync"), message: table, indicator: "green" });
