@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import frappe
 from frappe.model.document import Document
-from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, getdate, now_datetime, nowdate, time_diff_in_seconds
 
 # Hours a breach stays open before it auto-closes (once the wallet has recovered).
 BREACH_WINDOW_HOURS = 12
@@ -45,6 +45,8 @@ FB_SETTINGS_DOCTYPE = "Fuelbuddy Settings"
 # raises the overshoot Issue itself.
 QC_AMEND_FLAG = "fb_qc_amend"
 
+LEDGER = "Wallet Ledger Entry"
+
 
 def _wallet_enabled():
 	"""True when the Wallet feature is enabled in Fuelbuddy Settings (default off)."""
@@ -52,6 +54,19 @@ def _wallet_enabled():
 
 
 class Wallet(Document):
+	def validate(self):
+		# One wallet per customer: the DN blocker, the recompute and the ledger all key on it.
+		if self.payment_type == "Wallet" and (
+			self.has_value_changed("customer") or self.has_value_changed("payment_type")
+		):
+			other = frappe.db.get_value(
+				"Wallet",
+				{"customer": self.customer, "payment_type": "Wallet", "name": ["!=", self.name or ""]},
+				"name",
+			)
+			if other:
+				frappe.throw(f"Customer {self.customer} already has Wallet {other}.")
+
 	def before_save(self):
 		# When breach is (re)enabled, stamp date_of_breach = now so the 12h window
 		# (close_expired_breaches + the Delivery Note blocker) is measured from the
@@ -60,9 +75,17 @@ class Wallet(Document):
 		if self.enable_breach and self.has_value_changed("enable_breach"):
 			self.date_of_breach = now_datetime()
 
+	def on_trash(self):
+		# the customer's last wallet is gone: its entries stay but nothing counts them
+		if not frappe.db.exists("Wallet", {"customer": self.customer, "name": ["!=", self.name]}):
+			for entry in _live_entries(customer=self.customer):
+				_cancel_entry(entry.name)
+
 	def on_update(self):
 		if self.has_value_changed("wallet_start_date") or self.has_value_changed("opening_balance"):
 			recompute_from_deliveries(self.name, self.customer)
+			if _wallet_enabled():
+				sync_wallet_ledger(self.name)
 
 
 # -- balance helpers ---------------------------------------------------------
@@ -86,18 +109,27 @@ def customer_payments_total(customer, start_date=None):
 	) or {}
 	if start_date is None:
 		start_date = w.get("wallet_start_date")
+	return flt(w.get("opening_balance")) + sum(_pe_amount(pe) or 0.0 for pe in _tracked_payments(customer, start_date))
+
+
+def _tracked_payments(customer, start_date):
 	filters = {"docstatus": 1, "party_type": "Customer", "party": customer}
 	if start_date:
 		filters["posting_date"] = [">=", start_date]
-	total = 0.0
-	for pe in frappe.get_all(
-		"Payment Entry", filters=filters, fields=["payment_type", "base_paid_amount", "base_received_amount"]
-	):
-		if pe.payment_type == "Receive":
-			total += flt(pe.base_received_amount)
-		elif pe.payment_type == "Pay":
-			total -= flt(pe.base_paid_amount)
-	return flt(w.get("opening_balance")) + total
+	return frappe.get_all(
+		"Payment Entry",
+		filters=filters,
+		fields=["name", "posting_date", "company", "payment_type", "base_paid_amount", "base_received_amount"],
+	)
+
+
+def _pe_amount(pe):
+	"""Receive adds, Pay (refund) subtracts; anything else is not a wallet movement."""
+	if pe.payment_type == "Receive":
+		return flt(pe.base_received_amount)
+	if pe.payment_type == "Pay":
+		return -flt(pe.base_paid_amount)
+	return None
 
 
 def _wallet_start_date(customer):
@@ -122,8 +154,8 @@ def _dn_where(customer, start_date, docstatus, exclude=None):
 	return " and ".join(cond), params
 
 
-def _billable_net(customer, rows, as_on=None):
-	"""Net value of Delivery Note quantities AS THE INVOICE WILL BILL THEM.
+def _billable_rows(customer, rows, as_on=None):
+	"""(net value, priced at Force Majeure) per row, AS THE INVOICE WILL BILL IT.
 
 	``rows`` = (so_detail, sales_order, posting_date, item_code, qty, dn_net).
 	Mirrors fuelbuddy_crm invoicing in order:
@@ -144,61 +176,58 @@ def _billable_net(customer, rows, as_on=None):
 		from fuelbuddy_crm.auto_invoicing import _apply_quotation_discount
 		from fuelbuddy_crm.force_majeure import fm_rate, fm_resolver
 	except ImportError:  # crm app absent: wallet falls back to undiscounted DN value
-		return sum(flt(r[5]) for r in rows)
+		return [(flt(r[5]), False) for r in rows]
 	resolve = fm_resolver(customer)
-	total = 0.0
-	qty_by_line = {}  # (sales_order, so_detail) -> qty
-	for so_detail, so, on, item_code, qty, dn_net in rows:
+	out = [None] * len(rows)
+	net_qty, delivered_qty = {}, {}  # (sales_order, so_detail) -> qty
+	for i, (so_detail, so, on, item_code, qty, dn_net) in enumerate(rows):
 		qty = flt(qty)
 		pricing = resolve(on) if (resolve and on) else None
 		rate = fm_rate(pricing, item_code) if pricing else None
 		if rate:
-			total += qty * rate
+			out[i] = (qty * rate, True)
 		elif so_detail and so:
-			qty_by_line[(so, so_detail)] = qty_by_line.get((so, so_detail), 0.0) + qty
+			net_qty[(so, so_detail)] = net_qty.get((so, so_detail), 0.0) + qty
+			delivered_qty[(so, so_detail)] = delivered_qty.get((so, so_detail), 0.0) + max(qty, 0.0)
 		else:
-			total += flt(dn_net)
+			out[i] = (flt(dn_net), False)
 	per_so = {}
-	for (so, so_detail), qty in qty_by_line.items():
+	for (so, so_detail), qty in net_qty.items():
 		so_line = frappe.db.get_value("Sales Order Item", so_detail, ["price_list_rate", "rate"], as_dict=True)
+		qty = qty if qty > 0 else delivered_qty[(so, so_detail)]  # a fully returned line still prices its rows
 		if not so_line or qty <= 0:
 			continue
 		per_so.setdefault(so, []).append(
-			frappe._dict(qty=qty, price_list_rate=flt(so_line.price_list_rate) or flt(so_line.rate), rate=flt(so_line.rate))
+			frappe._dict(
+				so_detail=so_detail,
+				qty=qty,
+				price_list_rate=flt(so_line.price_list_rate) or flt(so_line.rate),
+				rate=flt(so_line.rate),
+			)
 		)
+	unit = {}  # (sales_order, so_detail) -> billed rate; unchanged when no discount
 	for so, lines in per_so.items():
 		# SimpleNamespace, not frappe._dict: the formula reads ``si.items`` as an attribute.
 		_apply_quotation_discount(
 			SimpleNamespace(posting_date=as_on, items=lines),
 			frappe.get_cached_doc("Sales Order", so),
 		)
-		total += sum(flt(l.rate) * flt(l.qty) for l in lines)  # rate unchanged when no discount
-	return total
+		unit.update({(so, line.so_detail): flt(line.rate) for line in lines})
+	for i, (so_detail, so, _on, _item, qty, _net) in enumerate(rows):
+		if out[i] is None:
+			out[i] = (flt(qty) * unit.get((so, so_detail), 0.0), False)
+	return out
+
+
+def _billable_net(customer, rows, as_on=None):
+	"""Net value of Delivery Note quantities as the invoice will bill them (see _billable_rows)."""
+	return sum(value for value, _fm in _billable_rows(customer, rows, as_on))
 
 
 def _tracked_dn_value(customer, start_date, docstatus, exclude=None):
-	"""Grand-total value (incl. VAT, company currency) of the customer's
-	wallet-tracked Delivery Notes as they will be billed: quantities valued by
-	_billable_net (transaction currency), then VAT and currency conversion put
-	back in one step at the set's own base_grand/net ratio.
-
-	# ponytail: one ratio over the whole set assumes a customer transacts in one
-	# currency; per-DN conversion_rate in the group-by if that ever changes."""
-	where, params = _dn_where(customer, start_date, docstatus, exclude)
-	rows = frappe.db.sql(
-		f"""select dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code,
-			sum(dni.qty), sum(dni.amount)
-			from `tabDelivery Note Item` dni
-			join `tabDelivery Note` dn on dn.name = dni.parent
-			where {where}
-			group by dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code""",
-		params,
-	)
-	grand, net = frappe.db.sql(
-		f"select sum(dn.base_grand_total), sum(dn.net_total) from `tabDelivery Note` dn where {where}",
-		params,
-	)[0]
-	return _billable_net(customer, rows) * (flt(grand) / flt(net) if flt(net) else 1.0)
+	"""Grand-total value (incl. VAT, company currency) of the customer's wallet-tracked
+	Delivery Notes as they will be billed: the sum of _dn_values."""
+	return sum(dn.value for dn in _dn_values(customer, start_date, docstatus, exclude).values())
 
 
 def _doc_dn_value(doc):
@@ -212,6 +241,42 @@ def _doc_dn_value(doc):
 	return _billable_net(doc.customer, rows, doc.posting_date) * vat
 
 
+def _dn_values(customer, start_date, docstatus=(0, 1), exclude=None):
+	"""{DN: value, fm, posting_date, docstatus, company} for the customer's wallet-tracked
+	DNs: _billable_rows per item line, then the DN's own VAT / currency ratio."""
+	where, params = _dn_where(customer, start_date, docstatus, exclude)
+	rows = frappe.db.sql(
+		f"""select dn.name, dni.so_detail, dni.against_sales_order, dn.posting_date, dni.item_code,
+			dni.qty, dni.amount, dn.base_grand_total, dn.net_total, dn.docstatus, dn.company
+			from `tabDelivery Note Item` dni
+			join `tabDelivery Note` dn on dn.name = dni.parent
+			where {where}""",
+		params,
+		as_dict=True,
+	)
+	values = _billable_rows(
+		customer,
+		[(r.so_detail, r.against_sales_order, r.posting_date, r.item_code, r.qty, r.amount) for r in rows],
+	)
+	out = {}
+	for r, (value, fm) in zip(rows, values):
+		net = flt(r.net_total)
+		dn = out.setdefault(
+			r.name,
+			frappe._dict(
+				value=0.0,
+				fm=False,
+				posting_date=r.posting_date,
+				docstatus=r.docstatus,
+				company=r.company,
+				vat=flt(r.base_grand_total) / net if net else 1.0,
+			),
+		)
+		dn.value += value * dn.vat
+		dn.fm = dn.fm or fm
+	return out
+
+
 def customer_delivered_total(customer, start_date=None):
 	"""Deal-discounted value of the customer's Delivery Notes (draft + submitted)
 	posted on or after the wallet start date."""
@@ -221,9 +286,11 @@ def customer_delivered_total(customer, start_date=None):
 
 
 def recompute_from_deliveries(wallet_name, customer):
-	"""Refresh received / delivered / remaining from Payment Entries and Delivery Notes."""
+	"""Refresh received / delivered / remaining from Payment Entries and Delivery Notes;
+	returns the per-DN values so the ledger reuses them."""
+	values = _dn_values(customer, _wallet_start_date(customer))
 	received = customer_payments_total(customer)
-	delivered = customer_delivered_total(customer)
+	delivered = sum(dn.value for dn in values.values())
 	frappe.db.set_value(
 		"Wallet",
 		wallet_name,
@@ -233,6 +300,7 @@ def recompute_from_deliveries(wallet_name, customer):
 			"amount_remaining": received - delivered,
 		},
 	)
+	return values
 
 
 def recompute_received(wallet_name):
@@ -277,17 +345,23 @@ def reconcile_wallet(wallet_name, apply=0):
 		"amount_remaining": received - delivered,
 	}
 	stored = {k: flt(w.get(k)) for k in expected}
-	in_sync = all(abs(stored[k] - flt(expected[k])) < 0.005 for k in expected)
+	ledger_total = wallet_ledger_total(w.customer)
+	in_sync = all(abs(stored[k] - flt(expected[k])) < 0.005 for k in expected) and (
+		abs(ledger_total - flt(expected["amount_remaining"])) < 0.005
+	)
 	corrected = False
 	if apply and not in_sync:
 		recompute_from_deliveries(wallet_name, w.customer)
 		corrected = True
+	if apply:
+		sync_wallet_ledger(wallet_name)
 	return {
 		"customer": w.customer,
 		"stored": stored,
 		"expected": expected,
 		"in_sync": in_sync,
 		"corrected": corrected,
+		"ledger_total": ledger_total,
 	}
 
 
@@ -425,15 +499,16 @@ def enforce_wallet_balance(doc, method=None):
 
 
 def update_wallet_on_delivery_note(doc, method=None):
-	"""Delivery Note `on_update` (fires on draft saves and on submit).
+	"""Delivery Note `on_update` (fires on draft saves and on submit) and
+	`on_update_after_submit` (a quantity fixed on a submitted DN).
 
 	Refresh received / delivered / remaining on the customer's wallet by
 	recomputing from the live Delivery Notes (docstatus 0/1)."""
 	if not _wallet_enabled():
 		return
 	wallet = get_customer_wallet(doc.customer)
-	if wallet:
-		recompute_from_deliveries(wallet, doc.customer)
+	values = recompute_from_deliveries(wallet, doc.customer) if wallet else None
+	post_to_wallet_ledger(doc, values)
 
 
 def update_wallet_on_delivery_note_cancel(doc, method=None):
@@ -445,6 +520,8 @@ def update_wallet_on_delivery_note_cancel(doc, method=None):
 	wallet = get_customer_wallet(doc.customer)
 	if wallet:
 		recompute_from_deliveries(wallet, doc.customer)
+	if method == "on_cancel":  # a deleted DN's entry was marked in on_trash
+		post_to_wallet_ledger(doc)
 
 
 def _recompute_received_for_customer(customer):
@@ -461,6 +538,7 @@ def update_wallet_on_payment_entry_submit(doc, method=None):
 	"""Payment Entry `on_submit` (was "Wallet amount update", After Submit)."""
 	if doc.party_type == "Customer":
 		_recompute_received_for_customer(doc.party)
+		post_to_wallet_ledger(doc)
 
 
 def update_wallet_on_payment_entry_cancel(doc, method=None):
@@ -469,6 +547,7 @@ def update_wallet_on_payment_entry_cancel(doc, method=None):
 	PE leaves amount_received inflated until an unrelated event recomputes."""
 	if doc.party_type == "Customer":
 		_recompute_received_for_customer(doc.party)
+		post_to_wallet_ledger(doc)
 
 
 def create_wallet_for_customer(doc, method=None):
@@ -489,6 +568,182 @@ def create_wallet_for_customer(doc, method=None):
 			"payment_type": "Wallet",
 		}
 	).insert(ignore_permissions=True)
+
+
+# -- wallet ledger (IDEV-3402): one entry per voucher the wallet counts --------
+
+
+def _voucher_customer(doc):
+	if doc.doctype == "Delivery Note":
+		return doc.customer
+	return doc.party if doc.party_type == "Customer" else None
+
+
+def _lock_wallet(customer):
+	"""The customer's live Wallet, its row locked: serializes the customer's ledger writes."""
+	name = customer and get_customer_wallet(customer)
+	if not name:
+		return None
+	return frappe.db.get_value(
+		"Wallet",
+		name,
+		["name", "customer", "wallet_start_date", "opening_balance", "creation"],
+		as_dict=True,
+		for_update=True,
+	)
+
+
+def _live_entries(**filters):
+	# ponytail: plain read (FOR UPDATE on a missing key gap-locks parallel DN inserts into a deadlock), so a
+	# Reconcile racing a voucher's own event can leave a duplicate until the next Reconcile; a unique live key would close it.
+	cond = " and ".join(f"`{k}` = %({k})s" for k in filters)
+	return frappe.db.sql(
+		f"""select name, customer, voucher_type, voucher_no, amount, posting_date, is_submitted,
+			force_majeure, force_majeure_change_date from `tabWallet Ledger Entry`
+			where is_cancelled = 0 and {cond} order by creation""",
+		filters,
+		as_dict=True,
+	)
+
+
+def _save_entry(doc):
+	doc.flags.from_wallet = doc.flags.ignore_permissions = True
+	doc.flags.ignore_links = True  # a cancelled entry's voucher may be deleted
+	doc.flags.notify_update = False
+	doc.save()
+
+
+def _cancel_entry(name):
+	doc = frappe.get_doc(LEDGER, name, for_update=True)
+	doc.is_cancelled = 1
+	_save_entry(doc)
+
+
+def _sync_voucher(live, customer, voucher_type, voucher_no, target, revalue=False):
+	"""Insert or update the voucher's one live entry from ``target``; None marks it cancelled."""
+	# extra entries (duplicates, a DN moved to another customer) are marked cancelled
+	keep = next((e for e in live if e.customer == customer), None) if target else None
+	for entry in live:
+		if entry is not keep:
+			_cancel_entry(entry.name)
+	if not target:
+		return
+	amount, posting_date, is_submitted, company, fm = target
+	if not keep:
+		doc = frappe.new_doc(LEDGER)
+		doc.update(
+			{
+				"customer": customer,
+				"company": company,
+				"posting_date": posting_date,
+				"voucher_type": voucher_type,
+				"voucher_no": voucher_no,
+				"amount": amount,
+				"is_submitted": is_submitted,
+				"force_majeure": cint(fm),
+				"force_majeure_change_date": nowdate() if fm else None,
+			}
+		)
+		doc.flags.from_wallet = doc.flags.ignore_permissions = True
+		doc.flags.notify_update = False
+		doc.submit()
+		return
+	moved = abs(flt(keep.amount) - flt(amount)) > 1e-6
+	before = (getdate(keep.posting_date), cint(keep.is_submitted), cint(keep.force_majeure))
+	if not moved and before == (getdate(posting_date), cint(is_submitted), cint(fm)) and (
+		keep.force_majeure_change_date and getdate(keep.force_majeure_change_date)
+	) == _fm_date(keep, fm, moved, revalue):
+		return
+	doc = frappe.get_doc(LEDGER, keep.name, for_update=True)
+	moved = abs(flt(doc.amount) - flt(amount)) > 1e-6  # the locked row, not the plain read
+	doc.update(
+		{
+			"amount": amount,
+			"posting_date": posting_date,
+			"is_submitted": is_submitted,
+			"force_majeure": cint(fm),
+			"force_majeure_change_date": _fm_date(doc, fm, moved, revalue),
+		}
+	)
+	_save_entry(doc)
+
+
+def _fm_date(entry, fm, moved, revalue):
+	"""FM date after this write: set while FM prices the entry, re-dated when FM starts or a Reconcile re-values it, cleared when FM stops."""
+	if not fm:
+		return None
+	if (moved and revalue) or not cint(entry.force_majeure) or not entry.force_majeure_change_date:
+		return getdate(nowdate())
+	return getdate(entry.force_majeure_change_date)
+
+
+def post_to_wallet_ledger(doc, values=None):
+	"""Make one Delivery Note's or Payment Entry's entry match what the wallet counts for it now."""
+	if not _wallet_enabled():
+		return
+	wallet = _lock_wallet(_voucher_customer(doc))
+	target = None
+	start = wallet and wallet.wallet_start_date
+	if wallet and doc.docstatus < 2 and not (start and getdate(doc.posting_date) < getdate(start)):
+		if doc.doctype == "Delivery Note":
+			dn = (values if values is not None else _dn_values(wallet.customer, start)).get(doc.name)
+			target = (-dn.value if dn else 0.0, doc.posting_date, cint(doc.docstatus == 1), doc.company, bool(dn and dn.fm))
+		elif doc.docstatus == 1 and _pe_amount(doc) is not None:
+			target = (_pe_amount(doc), doc.posting_date, 1, doc.company, False)
+	_sync_voucher(
+		_live_entries(voucher_type=doc.doctype, voucher_no=doc.name),
+		wallet.customer if wallet else None,
+		doc.doctype,
+		doc.name,
+		target,
+	)
+
+
+def cancel_wallet_entries_on_delete(doc, method=None):
+	"""Delivery Note / Payment Entry `on_trash`: the entry stays, marked cancelled."""
+	if not _wallet_enabled():
+		return
+	_lock_wallet(_voucher_customer(doc))
+	for entry in _live_entries(voucher_type=doc.doctype, voucher_no=doc.name):
+		_cancel_entry(entry.name)
+
+
+def sync_wallet_ledger(wallet_name):
+	"""Re-value every voucher of the wallet and write only the entries that changed;
+	entries of vouchers the wallet no longer counts are marked cancelled."""
+	w = _lock_wallet(frappe.db.get_value("Wallet", wallet_name, "customer"))
+	if not w or w.name != wallet_name:
+		return  # a duplicate wallet must not fight the live one over the entries
+	start = w.wallet_start_date
+	targets = {
+		("Delivery Note", name): (-dn.value, dn.posting_date, cint(dn.docstatus == 1), dn.company, dn.fm)
+		for name, dn in _dn_values(w.customer, start).items()
+	}
+	for pe in _tracked_payments(w.customer, start):
+		if _pe_amount(pe) is not None:
+			targets[("Payment Entry", pe.name)] = (_pe_amount(pe), pe.posting_date, 1, pe.company, False)
+	if flt(w.opening_balance):
+		targets[("Wallet", w.name)] = (
+			flt(w.opening_balance),
+			start or getdate(w.creation),
+			1,
+			frappe.defaults.get_global_default("company"),
+			False,
+		)
+	live = {}
+	for entry in _live_entries(customer=w.customer):
+		live.setdefault((entry.voucher_type, entry.voucher_no), []).append(entry)
+	for key in set(targets) | set(live):
+		_sync_voucher(live.get(key, []), w.customer, key[0], key[1], targets.get(key), revalue=True)
+
+
+def wallet_ledger_total(customer):
+	return flt(
+		frappe.db.sql(
+			"select sum(amount) from `tabWallet Ledger Entry` where customer = %s and is_cancelled = 0",
+			customer,
+		)[0][0]
+	)
 
 
 # -- scheduled tasks (wired in hooks.py scheduler_events) ---------------------
@@ -517,3 +772,16 @@ def close_expired_breaches():
 	if names:
 		frappe.db.commit()
 	return names
+
+
+def reconcile_all_wallets():
+	"""Daily, and the one-off backfill (`bench execute`): Reconcile every wallet, ledger included."""
+	if not _wallet_enabled():
+		return "Enable Wallet is off in Fuelbuddy Settings: nothing reconciled."
+	for name in frappe.get_all("Wallet", filters={"payment_type": "Wallet"}, pluck="name"):
+		try:
+			reconcile_wallet(name, apply=1)
+			frappe.db.commit()
+		except Exception:
+			frappe.db.rollback()
+			frappe.log_error(title=f"Wallet reconcile failed: {name}")
