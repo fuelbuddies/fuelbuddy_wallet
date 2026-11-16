@@ -308,6 +308,48 @@ def recompute_received(wallet_name):
 	)
 
 
+def breach_headroom(wallet, remaining):
+	"""What an active breach lets the wallet go below zero by: the breach amount, until the breach window has
+	passed and the wallet has recovered (``remaining`` >= 0), the rule the Delivery Note blocker applies."""
+	if not cint(wallet.enable_breach):
+		return 0.0
+	if wallet.date_of_breach and remaining >= 0:
+		hrs = time_diff_in_seconds(now_datetime(), wallet.date_of_breach) / 3600.0
+		if hrs >= BREACH_WINDOW_HOURS:
+			return 0.0
+	return flt(wallet.breach_amount)
+
+
+def open_hold_amount(customer):
+	"""Value held for fills at the pump whose Delivery Notes are not in yet, from the apps that hold it
+	(hook ``wallet_open_holds``: a function of the customer returning an amount)."""
+	return sum(flt(frappe.get_attr(fn)(customer)) for fn in frappe.get_hooks("wallet_open_holds"))
+
+
+def wallet_balance(customer):
+	"""The customer's Wallet with its live figures, or None: received (opening balance + Payment Entries),
+	delivered (draft + submitted Delivery Notes, as the invoice will bill them) and the breach headroom.
+	Read live rather than from the stored totals, which only move while the wallet feature is on."""
+	wallet = frappe.db.get_value(
+		"Wallet",
+		{"customer": customer, "payment_type": "Wallet"},
+		["name", "wallet_start_date", "enable_breach", "breach_amount", "date_of_breach"],
+		as_dict=True,
+	)
+	if not wallet:
+		return None
+	received = customer_payments_total(customer)
+	delivered = _tracked_dn_value(customer, wallet.wallet_start_date, (0, 1))
+	remaining = received - delivered
+	return frappe._dict(
+		name=wallet.name,
+		received=received,
+		delivered=delivered,
+		remaining=remaining,
+		headroom=breach_headroom(wallet, remaining),
+	)
+
+
 @frappe.whitelist()
 def reconcile_wallet(wallet_name, apply=0):
 	"""Check the stored received / delivered / remaining against live Payment Entry and
@@ -375,6 +417,8 @@ def enforce_wallet_balance(doc, method=None):
 		return  # not the first punch: a re-save, the submit of a draft, an amendment or a return
 	if not _wallet_enabled():
 		return  # feature disabled in Fuelbuddy Settings -> never block on wallet balance
+	if doc.get("custom_task_id"):
+		return  # a pump fill: its dispense hold covers it (IDEV-3496), and the fuel is already in the vehicle
 	# for_update: serialize concurrent DN saves for this customer on the wallet row. Without
 	# it two deliveries read the same committed/other_drafts, both pass, and the wallet goes
 	# negative (TOCTOU). Held to the end of this transaction; a competing save waits, then
@@ -408,7 +452,9 @@ def enforce_wallet_balance(doc, method=None):
 	start = wallet.wallet_start_date
 	committed = _tracked_dn_value(doc.customer, start, (1,))
 	other_drafts = _tracked_dn_value(doc.customer, start, (0,), exclude=doc.name or "")
-	available = flt(wallet.amount_received) - committed - other_drafts
+	# money promised to fills already at the pump, whose Delivery Notes are not in yet
+	held = open_hold_amount(doc.customer)
+	available = flt(wallet.amount_received) - committed - other_drafts - held
 	dn_amount = _doc_dn_value(doc)
 
 	if (available - dn_amount) >= 0:
@@ -451,6 +497,7 @@ def enforce_wallet_balance(doc, method=None):
 			"Wallet Received: " + str(flt(wallet.amount_received)) + "<br>"
 			"Committed (submitted DNs): " + str(committed) + "<br>"
 			"Open Drafts Reserved (others): " + str(other_drafts) + "<br>"
+			"Held for fills at the pump: " + str(held) + "<br>"
 			"Available: " + str(available) + "<br>"
 			"Shortfall: " + str(shortfall) + "<br>"
 			"Breach Enabled: " + str(wallet.enable_breach) + "<br>"
