@@ -150,15 +150,19 @@ doc_events = {
 		# draft insert / draft re-save (incl. amendments), which is exactly the punch path.
 		"before_save": f"{_WALLET}.enforce_wallet_balance",
 		"on_update": f"{_WALLET}.update_wallet_on_delivery_note",
+		"on_update_after_submit": f"{_WALLET}.update_wallet_on_delivery_note",
 		# Reverse a DN's wallet impact when it leaves the delivered set:
 		#   on_cancel   -- submitted DN 1->2 (docstatus 2 no longer counted)
 		#   after_delete-- draft DN deleted (e.g. backend order-cancel deletes the draft)
 		"on_cancel": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
+		# on_trash, not after_delete: the ledger entry is marked while the DN still exists
+		"on_trash": f"{_WALLET}.cancel_wallet_entries_on_delete",
 		"after_delete": f"{_WALLET}.update_wallet_on_delivery_note_cancel",
 	},
 	"Payment Entry": {
 		"on_submit": f"{_WALLET}.update_wallet_on_payment_entry_submit",
 		"on_cancel": f"{_WALLET}.update_wallet_on_payment_entry_cancel",
+		"on_trash": f"{_WALLET}.cancel_wallet_entries_on_delete",
 	},
 	"Customer": {
 		"after_insert": f"{_WALLET}.create_wallet_for_customer",
@@ -173,7 +177,13 @@ scheduler_events = {
 	"hourly": [
 		f"{_WALLET}.close_expired_breaches",
 	],
+	"daily": [
+		f"{_WALLET}.reconcile_all_wallets",
+	],
 }
+
+# entries outlive their voucher (marked cancelled), so they must not block its cancel or delete
+ignore_links_on_delete = ["Wallet Ledger Entry"]
 
 # scheduler_events = {
 # 	"all": [
